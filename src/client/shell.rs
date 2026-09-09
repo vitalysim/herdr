@@ -2,15 +2,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 mod actions;
 mod agent_sidebar;
+mod aggregate_navigation;
+mod workspace_navigation;
+use workspace_navigation::WorkspaceNavigationTarget;
 mod composition;
 mod config;
 mod context_menu;
 mod copy_mode;
+mod endpoint_agent_state;
+mod endpoint_agents;
+mod endpoint_navigation;
+mod endpoint_notices;
+mod endpoint_sidebar;
+mod endpoints;
+pub(super) use endpoints::*;
 mod global_menu;
 mod graphics;
 mod input;
+mod input_source;
 mod mobile;
 mod mouse;
+mod notification_policy;
 mod notifications;
 mod overlay_input;
 mod preferences;
@@ -21,6 +33,7 @@ mod state;
 mod surface_patch;
 mod worktrees;
 
+pub(in crate::client::shell) use render::sidebar;
 pub(crate) use state::*;
 #[cfg(test)]
 pub(super) use surface_patch::apply_composed_surface_patch;
@@ -34,6 +47,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
+use super::endpoint::{ClientEndpointId, ClientEndpointStatus, SavedSshEndpoint};
 use crate::app::state::Palette;
 use crate::config::{
     Config, LiveKeybindConfig, SidebarCollapsedModeConfig, SpacesSidebarConfig,
