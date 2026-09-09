@@ -1222,6 +1222,32 @@
     },
     "request": {
       "$defs": {
+        "AgentPromptIfIdleParams": {
+          "description": "Submit a prompt only if the resolved pane still hosts the idle agent that\nthe caller inspected. The identity and state checks run in the same app\nturn that queues the terminal input, closing the race between `agent.get`\nand `agent.prompt` without changing the latter's in-turn semantics.",
+          "properties": {
+            "expected_state_change_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal_id",
+            "expected_state_change_seq"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -5459,6 +5485,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_if_idle",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptIfIdleParams"
             }
           },
           "required": [

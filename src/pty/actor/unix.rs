@@ -1170,26 +1170,27 @@ mod tests {
             let mut enter = [0; 1];
             peer.read_exact(&mut enter).expect("peer receives enter");
             let enter_received = Instant::now();
-            let mut user = [0; 4];
-            peer.read_exact(&mut user)
-                .expect("peer receives queued input");
-            (prompt_completed, enter_received, enter, user)
+            let mut interrupt = [0; 1];
+            peer.read_exact(&mut interrupt)
+                .expect("peer receives queued interrupt");
+            (prompt_completed, enter_received, enter, interrupt)
         });
 
         let completion = handle
             .queue_user_input_submission(text, Bytes::from_static(b"\r"), delay)
             .expect("submission queues");
         handle
-            .try_write_user_input(Bytes::from_static(b"user"))
-            .expect("ordinary input queues behind submission");
+            .try_write_user_input(Bytes::from_static(b"\x03"))
+            .expect("interrupt queues behind submission");
         completion
             .recv()
             .expect("actor reports submission")
             .expect("submission completes");
-        let (prompt_completed, enter_received, enter, user) = reader.join().expect("reader joins");
+        let (prompt_completed, enter_received, enter, interrupt) =
+            reader.join().expect("reader joins");
 
         assert_eq!(enter, *b"\r");
-        assert_eq!(user, *b"user");
+        assert_eq!(interrupt, *b"\x03");
         assert!(enter_received.duration_since(prompt_completed) >= delay / 2);
 
         let err = match handle.queue_user_input_submission(

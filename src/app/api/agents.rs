@@ -3,14 +3,20 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptIfIdleParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+
+#[derive(Debug)]
+struct AgentPromptIdleGuard {
+    expected_terminal_id: String,
+    expected_state_change_seq: u64,
+}
 
 fn agent_prompt_submit_delay(agent: crate::detect::Agent, prompt_bytes: usize) -> Duration {
     #[cfg(windows)]
@@ -76,10 +82,27 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let (params, idle_guard) = match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => (params, None),
+            crate::api::schema::Method::AgentPromptIfIdle(AgentPromptIfIdleParams {
+                target,
+                text,
+                expected_terminal_id,
+                expected_state_change_seq,
+            }) => (
+                AgentPromptParams {
+                    target,
+                    text,
+                    wait: None,
+                },
+                Some(AgentPromptIdleGuard {
+                    expected_terminal_id,
+                    expected_state_change_seq,
+                }),
+            ),
+            _ => return false,
         };
-        match self.queue_agent_prompt(request.id, params) {
+        match self.queue_agent_prompt(request.id, params, idle_guard) {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
@@ -104,6 +127,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
+        idle_guard: Option<AgentPromptIdleGuard>,
     ) -> Result<
         (
             String,
@@ -135,6 +159,52 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        if let Some(guard) = idle_guard {
+            if terminal_id.as_str() != guard.expected_terminal_id {
+                return Err(encode_error(
+                    id,
+                    "agent_changed",
+                    format!(
+                        "agent {} now uses terminal {}; expected {}",
+                        params.target, terminal_id, guard.expected_terminal_id
+                    ),
+                ));
+            }
+            let state_change_seq = terminal.last_agent_state_change_seq.unwrap_or(0);
+            if state_change_seq != guard.expected_state_change_seq {
+                return Err(encode_error(
+                    id,
+                    "agent_state_changed",
+                    format!(
+                        "agent {} state changed from sequence {} to {}",
+                        params.target, guard.expected_state_change_seq, state_change_seq
+                    ),
+                ));
+            }
+            match terminal.state {
+                crate::detect::AgentState::Idle => {}
+                crate::detect::AgentState::Working => {
+                    return Err(encode_error(
+                        id,
+                        "agent_not_idle",
+                        format!("agent {} is working", params.target),
+                    ));
+                }
+                crate::detect::AgentState::Blocked => {
+                    return Err(encode_error(
+                        id,
+                        "agent_blocked",
+                        format!(
+                            "agent {} is blocked and requires interactive input",
+                            params.target
+                        ),
+                    ));
+                }
+                crate::detect::AgentState::Unknown => {
+                    return Err(agent_not_ready(id, &params.target));
+                }
+            }
+        }
         if terminal.state == crate::detect::AgentState::Blocked {
             return Err(encode_error(
                 id,
@@ -402,26 +472,48 @@ mod tests {
         app
     }
 
-    fn start_deferred_agent_prompt(
+    fn start_deferred_agent_request(
         app: &mut App,
         id: &str,
-        params: AgentPromptParams,
+        method: crate::api::schema::Method,
     ) -> std::sync::mpsc::Receiver<String> {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(app.handle_deferred_agent_api_request(
             crate::api::schema::Request {
                 id: id.into(),
-                method: crate::api::schema::Method::AgentPrompt(params),
+                method,
             },
             respond_to,
         ));
         response_rx
     }
 
+    fn start_deferred_agent_prompt(
+        app: &mut App,
+        id: &str,
+        params: AgentPromptParams,
+    ) -> std::sync::mpsc::Receiver<String> {
+        start_deferred_agent_request(app, id, crate::api::schema::Method::AgentPrompt(params))
+    }
+
     fn run_deferred_agent_prompt(app: &mut App, id: &str, params: AgentPromptParams) -> String {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    fn run_deferred_agent_prompt_if_idle(
+        app: &mut App,
+        id: &str,
+        params: AgentPromptIfIdleParams,
+    ) -> String {
+        start_deferred_agent_request(
+            app,
+            id,
+            crate::api::schema::Method::AgentPromptIfIdle(params),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .expect("guarded agent prompt responds")
     }
 
     #[test]
@@ -548,6 +640,83 @@ mod tests {
             .is_err(),
             "blocked prompt wrote or scheduled terminal input"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_if_idle_requires_matching_agent_snapshot() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.last_agent_state_change_seq = Some(41);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = run_deferred_agent_prompt_if_idle(
+            &mut app,
+            "req-ok",
+            AgentPromptIfIdleParams {
+                target: "reviewer".into(),
+                text: "safe prompt".into(),
+                expected_terminal_id: terminal_id.to_string(),
+                expected_state_change_seq: 41,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"safe prompt"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+
+        let cases = [
+            ("wrong-terminal", 41, AgentState::Idle, "agent_changed"),
+            (
+                terminal_id.as_str(),
+                40,
+                AgentState::Idle,
+                "agent_state_changed",
+            ),
+            (
+                terminal_id.as_str(),
+                41,
+                AgentState::Working,
+                "agent_not_idle",
+            ),
+            (
+                terminal_id.as_str(),
+                41,
+                AgentState::Blocked,
+                "agent_blocked",
+            ),
+            (
+                terminal_id.as_str(),
+                41,
+                AgentState::Unknown,
+                "agent_not_ready",
+            ),
+        ];
+        for (expected_terminal_id, expected_state_change_seq, state, expected_code) in cases {
+            app.state.terminals.get_mut(&terminal_id).unwrap().state = state;
+            let response = run_deferred_agent_prompt_if_idle(
+                &mut app,
+                expected_code,
+                AgentPromptIfIdleParams {
+                    target: "reviewer".into(),
+                    text: "must not write".into(),
+                    expected_terminal_id: expected_terminal_id.into(),
+                    expected_state_change_seq,
+                },
+            );
+            let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, expected_code);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

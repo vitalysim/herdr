@@ -125,6 +125,30 @@ fn agent_start_and_prompt_requests_round_trip() {
         prompt
     );
 
+    let guarded_prompt = Request {
+        id: "guarded-prompt".into(),
+        method: Method::AgentPromptIfIdle(AgentPromptIfIdleParams {
+            target: "reviewer".into(),
+            text: "review this".into(),
+            expected_terminal_id: "term_123".into(),
+            expected_state_change_seq: 42,
+        }),
+    };
+    let guarded_prompt_json = serde_json::to_value(&guarded_prompt).unwrap();
+    assert_eq!(guarded_prompt_json["method"], "agent.prompt_if_idle");
+    assert_eq!(
+        guarded_prompt_json["params"]["expected_terminal_id"],
+        "term_123"
+    );
+    assert_eq!(
+        guarded_prompt_json["params"]["expected_state_change_seq"],
+        42
+    );
+    assert_eq!(
+        serde_json::from_value::<Request>(guarded_prompt_json).unwrap(),
+        guarded_prompt
+    );
+
     let prompt_and_wait = Request {
         id: "prompt-and-wait".into(),
         method: Method::AgentPrompt(AgentPromptParams {

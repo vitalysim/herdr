@@ -183,6 +183,18 @@ pub struct AgentPromptParams {
     pub wait: Option<AgentPromptWaitOptions>,
 }
 
+/// Submit a prompt only if the resolved pane still hosts the idle agent that
+/// the caller inspected. The identity and state checks run in the same app
+/// turn that queues the terminal input, closing the race between `agent.get`
+/// and `agent.prompt` without changing the latter's in-turn semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentPromptIfIdleParams {
+    pub target: String,
+    pub text: String,
+    pub expected_terminal_id: String,
+    pub expected_state_change_seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
