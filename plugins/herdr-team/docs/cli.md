@@ -428,12 +428,7 @@ document is mirrored to `members/<name>.md`.
 | `--discard` | throw that edit away and restore the file from the authoritative copy |
 | `--clear` | remove the document |
 
-`--adopt` is what makes an edit the operator's word. The project folder is
-inside a checkout the agents can write to and the plugin cannot tell whose
-editor saved the file, so an edited `members/<name>.md` is **kept, not
-imported**: the notifier stops overwriting it, posts one `instructions_edited`
-record to you naming the adopt command, and waits. Until you adopt, nothing
-from that file reaches any agent.
+In manual sync mode, edited member files are preserved until `--adopt` shows the diff and imports them. In auto mode, settled edits are imported and the affected member is notified at its next safe opportunity. Auto mode trusts everyone who can write these project documents; editor identity cannot be inferred. Private Notes remain excluded from agent context.
 
 Every write bumps the member's `instructions_seq` and appends an
 `instructions_updated` record addressed to **the member and to `all`**, so the
@@ -504,8 +499,17 @@ removed or renamed. Those get a tombstone written over their file instead.
 
 ### `project render [--force]`
 
-Regenerates the mirror. Runs automatically after a roster change and after
-any write to the knowledge base or a member's instructions.
+Regenerates the mirror. Runs automatically after a roster change and after writes to rules or member instructions. Pending auto-sync edits and conflicts are preserved unless an operator explicitly forces regeneration.
+
+### `project sync auto|manual`
+
+Choose whether saved member documents and the Rules section of `knowledge.md` are imported automatically. New teams default to `auto`; existing teams stay `manual` until an operator enables it. `project` shows the mode; `--json project` also reports per-file pending hashes and errors. Auto mode trusts project-document writers, not just the human editor, and imports are audited as `file-sync`. It grants no additional CLI authority.
+
+The notifier waits for two unchanged scans at least two seconds apart before importing. Member changes notify that member; shared-rule changes notify each active agent. Delivery waits for a safe composer, while existing revision acknowledgements show whether the agent has read the update. Findings remain generated and attributed: edit only the Rules section and use `knowledge add` for findings. Conflicting CLI/file edits, malformed files, symlinks, and edited findings are preserved and reported to the operator. Deleting a file does not clear instructions. Reconcile conflicts with the stored text before saving again, or use the explicit discard/render controls after saving any edits you want to keep.
+
+### Native conversation names
+
+Fresh CLI-created Claude Code, Codex, and OpenCode sessions use the full member name as their native conversation title. Claude receives `--name`; Codex receives `/rename` through its idle composer before briefing; OpenCode updates the exact reported session through its managed loopback server. Resuming a conversation preserves its existing title. Naming failures are reported without preventing team operation, and ambiguous Codex command submissions are not blindly replayed.
 
 ### `knowledge-status`
 

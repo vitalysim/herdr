@@ -124,14 +124,7 @@ one team routinely sit in different checkouts.
 
 Three properties make it safe to put in a repository agents can write to:
 
-- **The mirror is never truth.** The authoritative copies live in the team
-  state dir behind human-only commands, and every read that feeds an agent's
-  context comes from there. Since 0.6 one file is editable in place, the
-  member's own `members/<name>.md`: an edit to it is **kept** rather than
-  overwritten, but it is still not truth until `instructions <name> --adopt`
-  imports it, and that command is human only. Everything else is still
-  regenerated. Without this an agent could edit a file and have it read back
-  to a teammate as the operator's instruction.
+- **Document trust is configurable.** Agent context reads stored state. In manual mode, member edits require `instructions <name> --adopt`. In auto mode, settled member edits and the Rules section of `knowledge.md` are imported as `file-sync` changes and affected agents are notified. Auto mode trusts all project-document writers; it is the default for new teams, while existing teams keep manual mode until an operator runs `project sync auto`. Generated findings never become instructions, and private Notes never enter agent context.
 - **Consent is explicit.** `config.project_dir` is empty until a human runs
   `project set`. Nothing is inferred from member cwds, so the plugin cannot
   write into the wrong repository or into two of them.
@@ -148,7 +141,8 @@ exists:
 | --- | --- | --- |
 | `knowledge set` | `knowledge_updated` | everyone, next board read |
 | `instructions --set/--edit/--adopt` | `instructions_updated` | the member itself, nudged when idle; everyone else on their next board read |
-| editing `members/<name>.md` | `instructions_edited` | you, so you can adopt it |
+| editing `members/<name>.md` | auto: `instructions_updated`; manual: `instructions_edited` | auto: affected member when safe; manual: you, to adopt it |
+| editing Rules in `knowledge.md` (auto mode) | `knowledge_updated` | every active agent when safe; Findings edits are reported as conflicts |
 | `project set` | `project_set` | everyone, next board read |
 | `knowledge add` | `knowledge_finding` | everyone, next board read |
 | a file in `artifacts/` | `artifacts_changed` | everyone, next board read |

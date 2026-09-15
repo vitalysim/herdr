@@ -141,6 +141,8 @@ Open the current space's team with `prefix+u`, `herdr-synapse ui console`, or
 the `herdr-synapse.console` action. A session can have one console per team;
 `b` in the Teams view opens the highlighted team's board directly.
 
+Inter-team messages stand out in bold magenta with `[⇄ TEAM IN]` or `[⇄ TEAM OUT]` badges, including in the full feed. Direction is relative to the board you are viewing. Wrapped lines keep the same style; monochrome terminals retain bold text and ASCII mode uses `<->`. Use `/filter teams` to isolate this traffic or `/filter all` to show everything.
+
 ### Console keys
 
 | Key | Result |
@@ -845,7 +847,7 @@ herdr-synapse asks [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket P
 <summary><code>project</code> — show, set or clear the team&#x27;s project directory</summary>
 
 ```text
-herdr-synapse project [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket PATH] [--session-mismatch-ok] [--force] [{set,clear,render}] [path]
+herdr-synapse project [-h] [--json] [--team NAME|PATH] [--session NAME] [--socket PATH] [--session-mismatch-ok] [--force] [{set,clear,render,sync}] [path]
 ```
 
 </details>

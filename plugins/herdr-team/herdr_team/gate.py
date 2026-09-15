@@ -507,7 +507,7 @@ def is_horizontal_rule(line: str) -> bool:
 
 
 def is_codex_prompt_line(line: str) -> bool:
-    return line == "›" or line.startswith("› ")
+    return line == "›" or line.startswith("› ") or (line.startswith("›") and _codex_empty_placeholder(line[1:]))
 
 
 #: Placeholder text Codex 0.153 paints on an empty prompt line ("› Ask Codex to do anything"); it is
@@ -516,12 +516,20 @@ def is_codex_prompt_line(line: str) -> bool:
 CODEX_PROMPT_PLACEHOLDERS = ("Ask Codex to do anything",)
 
 
+def _codex_empty_placeholder(text: str) -> bool:
+    # Codex 0.154's animation paints Braille around (not within) its empty
+    # placeholder. Only normalize those margins when the entire known label
+    # matches. Braille-only input and actual drafts remain untouched.
+    decoration = " \t" + "".join(chr(n) for n in range(0x2800, 0x2900))
+    return text.strip(decoration) in CODEX_PROMPT_PLACEHOLDERS
+
+
 def codex_prompt_draft(line: str) -> str:
     """The draft on a Codex prompt line, ``""`` for the bare marker or a known placeholder."""
     if line == "›":
         return ""
-    draft = line[2:].strip()
-    return "" if draft in CODEX_PROMPT_PLACEHOLDERS else draft
+    draft = line[1:].strip()
+    return "" if _codex_empty_placeholder(draft) else draft
 
 
 def after_last_horizontal_rule(text: Optional[str]) -> str:

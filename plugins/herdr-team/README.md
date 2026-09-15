@@ -114,9 +114,9 @@ filter: [all]  to me  requests  human  system  teams  team  (Tab cycles)   ? hel
   board announcement, and an audit line on every use.
 - **Instructions you actually edit.** Every member gets a document with the
   same six sections: mission, scope, constraints, definition of done,
-  handoffs, and notes you keep private. Edit the file in your repo, and one
-  command shows the diff and applies it. Claude receives the change through
-  its next hook; other trusted kinds are nudged to read it.
+  handoffs, and notes you keep private. Save edits to auto-sync them, or use
+  manual adoption to review each diff. Changed instructions notify the
+  affected member when delivery is safe.
 - **A folder the team shares.** `herdr-synapse project set <path>` gives the
   team `.herdr-synapse/<team>/` in your project: the rules, one instructions
   file per member, a live `board.md`, and an `artifacts/` directory the agents
@@ -544,11 +544,11 @@ outward. Replies thread across the two boards, so `re#N` is right on both
 sides, and when the receiving manager reads the post a receipt comes back:
 `read by <manager>` on the mirror.
 
-In the console, `/filter teams` shows only what crossed a link and
-`/filter team` everything else; `board --teams` is the same on the CLI. Link
-lines carry `⇄` and the sender's team. In the teams view, `c` on a team row
-lists the other teams: Enter links or breaks, and a team without a manager
-says so.
+In the console, `/filter teams` shows only what crossed a link and `/filter team` everything else; `board --teams` is the same on the CLI.
+
+Inter-team messages use bold magenta with `[⇄ TEAM IN]` / `[⇄ TEAM OUT]` badges, so they stand out even in the full feed. Direction is relative to the current team's board; monochrome terminals retain bold text and ASCII mode uses `<->`.
+
+In the teams view, `c` on a team row lists the other teams: Enter links or breaks, and a team without a manager says so.
 
 Managers are told about every link in their briefing and in `me`, along with
 the command to use. The skill tells every agent that a linked team's manager is
@@ -615,7 +615,9 @@ them apart. Give the team a directory and it gets one:
   artifacts/           work products; git-ignored
 ```
 
-Each member's file has the same six sections, with a line of guidance in each: Mission, Scope, Constraints, Definition of done, Handoffs, and Notes, which stays private to you. Mission is required when a member joins; the other five sections are optional. Team creation fills Mission from the required brief, or derives the short roster brief from an explicit `## Mission`, so nobody starts at "none set". `knowledge-status`, `doctor` and the teams view report any older or hand-edited member that has no Mission. Edit the file in your editor and the notifier leaves it alone and tells you; `herdr-synapse instructions <name> --adopt` shows the diff and applies it. That confirm step is the whole security model: the folder is inside a checkout your agents can write to, so nothing there counts as your word until you say it does.
+Each member's file has six sections: Mission, Scope, Constraints, Definition of done, Handoffs, and private Notes. Mission is required at creation; the remaining sections are optional. New teams automatically import saved member edits and the Rules section of `knowledge.md`, then notify affected agents when delivery is safe. Findings remain generated and attributed; private Notes stay out of agent context. Existing teams retain manual adoption until you run `herdr-synapse project sync auto`. Auto-sync trusts everyone who can write these documents. Use `project sync manual` to require explicit `instructions <name> --adopt` again. Conflicting edits are preserved and reported, never silently discarded. [Document sync reference](docs/cli.md#project-sync-automanual)
+
+Fresh CLI-created Claude Code, Codex, and OpenCode conversations also receive their full team-member name as a native session title. Resuming a saved conversation preserves its title. Naming failures appear on the board without preventing team operation.
 
 On daemon load or an explicit `project render`, Synapse completes only the exact revision-1 Mission-only scaffold written by the old creation path. It adds the five empty standard sections without changing the revision or posting to the board, and leaves edited, custom and later-revision documents untouched.
 
@@ -831,12 +833,7 @@ those are peer notes, attributed and escaped, and they are pointed at rather
 than injected, so one agent's text can never reach another wearing your
 authority.
 
-`instructions <name>` writes one member's own document: mission, scope,
-constraints, definition of done, handoffs, and notes that stay private to you.
-Scope is what stops two agents auditing the same tree. You can also edit
-`<team>/members/<name>.md` in your project folder and run `instructions <name>
---adopt`, which shows a diff first; that folder is writable by the agents
-themselves, so nothing in it reaches anyone until you adopt it.
+`instructions <name>` writes one member's own document: mission, scope, constraints, definition of done, handoffs, and private notes. In auto-sync mode, save `<team>/members/<name>.md` to apply changes and notify that member. In manual mode, `instructions <name> --adopt` shows the diff first. `project` reports the mode; auto-sync trusts project-document writers, including agents.
 
 ## When an agent needs you
 
