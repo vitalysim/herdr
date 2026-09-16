@@ -211,7 +211,7 @@ SAY_MAX_AGE_S = 10.0
 #: Origins whose ``direct`` records the daemon types: the verified console only (``cmd_board.SAY_VIAS``).
 SAY_VIAS = ("console",)
 #: Kinds verified live to queue text typed into a running turn (``!!``); other kinds are typed but flagged.
-FORCE_VERIFIED_KINDS = ("claude", "codex", "opencode")
+FORCE_VERIFIED_KINDS = ("claude", "codex", "opencode", "pi")
 RENUDGE_AFTER_S = (120.0, 300.0, 600.0)
 # The post TTL (plan 8.3, 30 min of target-active time) is ``gate.POST_TTL_MS``, per team via ``config.gate.post_ttl_ms``.
 BRIEF_ACK_S = 90.0
@@ -3233,8 +3233,21 @@ class Daemon:
             record = roster.read_pane_record(self.session, str(terminal)) or {}
             configured_model = _models.effective_setting(team.roster.get("config"), member)[0]
             try:
-                reading = _context.read_member(member.get("kind"), member.get("session"), record,
-                                               home=_context.home_dir(self.env), configured_model=configured_model)
+                if member.get("kind") == "pi":
+                    from . import pi_support
+
+                    data = pi_support.read_snapshot(self.session, member)
+                    reading = pi_support.reading(data) if data else None
+                    if data:
+                        self._poll_pi_compaction(team, member, data, now)
+                    elif rt.context is not None:
+                        rt.context = None
+                        rt.context_severity = None
+                        self.who_dirty = True
+                        self._stamp_context(team, member, _context.Reading(None, None, "pi-unavailable"), now)
+                else:
+                    reading = _context.read_member(member.get("kind"), member.get("session"), record,
+                                                   home=_context.home_dir(self.env), configured_model=configured_model)
             except Exception as err:  # noqa: BLE001 - a malformed transcript is not fatal
                 self.log("{}: cannot read {}'s context: {}".format(team.name, name, err))
                 continue
@@ -3252,13 +3265,55 @@ class Daemon:
             rt.context = encoded
             self.who_dirty = True
             open_control = rt.control_pending
-            if isinstance(open_control, dict) and open_control.get("action") == "model" \
-                    and _models.observed_matches(member.get("kind"), open_control.get("model"), reading.model):
-                self._note_model_applied(team, name, reading.model, now)
-            if same_history:
+            if isinstance(open_control, dict) and open_control.get("action") == "model":
+                matches = _models.observed_matches(member.get("kind"), open_control.get("model"), reading.model)
+                if member.get("kind") == "pi":
+                    matches = bool(data and pi_support.matches_control(data, member, open_control)
+                                   and data["at"] >= open_control.get("typed_at", float("inf"))
+                                   and data["instance"] != open_control.get("pi_previous_instance")
+                                   and (not open_control.get("model") or matches)
+                                   and (not open_control.get("effort") or open_control["effort"] == data.get("effort")))
+                if matches:
+                    self._note_model_applied(team, name, reading.model, now)
+            if same_history and member.get("kind") != "pi":
                 self._check_context_drop(team, name, reading, previous, now)
             self._stamp_context(team, member, reading, now)
             self._announce_context(team, name, reading)
+
+    def _poll_pi_compaction(self, team: TeamState, member: Dict[str, Any], data: Dict[str, Any], now: float) -> None:
+        event = data.get("compact")
+        if not event:
+            return
+        target = team.paths.root / "pi-events.json"
+        seen = store.read_json(target, default={})
+        if not isinstance(seen, dict):
+            seen = {}
+        name = str(member["name"])
+        key = [member.get("terminal_id"), data["session"], event["id"]]
+        if seen.get(name) == key:
+            return
+        pending = team.rt(name).control_pending
+        if pending and pending.get("action") != "compact":
+            return  # Defer rather than lose a lifecycle event during another control.
+        seen[name] = key
+        store.write_json(target, seen)
+        from . import pi_support
+
+        if pending and (not pi_support.matches_control(data, member, pending)
+                        or event["at"] < pending.get("typed_at", float("inf"))):
+            return  # A previous native event cannot complete this control request.
+        if event["status"] == "success":
+            self._note_compacted(team, name, "Pi native compaction completed")
+        elif pending:
+            team.rt(name).control_pending = None
+            work = team.pending.get(name)
+            if work is not None and work.kind == "control":
+                if work.attempt_id:
+                    team.ledger.record_outcome(work.attempt_id, False, max(0.0, now - (work.landed_ms or now)))
+                del team.pending[name]
+            self._append_system(team, "typed", "{}: Pi compaction failed or was cancelled".format(name),
+                                ["human"], {"member": name, "action": "compact", "result": "failed"})
+            self.who_dirty = True
 
     def _check_context_drop(self, team: TeamState, name: str, reading: "_context.Reading", previous: Optional[Dict[str, Any]], now: float) -> None:
         """A large fall in a member's token count is a compaction happening.
@@ -3274,7 +3329,7 @@ class Daemon:
         before = (open_control or {}).get("used")
         if not isinstance(before, int) or before <= 0:
             before = (previous or {}).get("used") if isinstance(previous, dict) else None
-        if not isinstance(before, int) or before <= 0 or reading.used >= before * CONTROL_DROP_RATIO:
+        if reading.used is None or not isinstance(before, int) or before <= 0 or reading.used >= before * CONTROL_DROP_RATIO:
             return
         if isinstance(open_control, dict):
             # A ``clear`` drops the count too, but a clear is proven by the new
@@ -3332,7 +3387,7 @@ class Daemon:
             return
         rt = team.rt(str(member.get("name")))
         percent = reading.percent
-        value = "{:.0f}%".format(percent) if percent is not None else None
+        value = "{}{:.0f}%".format("~" if reading.estimated else "", percent) if percent is not None else None
         severity = _usage.severity_for(percent)
         stamp = "{}:{}".format(severity or _usage.NORMAL, value or "unknown")
         unchanged = rt.context_stamp_value == stamp and rt.context_stamp_ms is not None and now - rt.context_stamp_ms < TASK_RESTAMP_S * 1000.0
@@ -3475,6 +3530,12 @@ class Daemon:
         name = str(member["name"])
         rt = team.rt(name)
         control = dict(pending.control or {})
+        submitted_at = time.time()
+        pi_previous_instance = None
+        if member.get("kind") == "pi":
+            from . import pi_support
+
+            pi_previous_instance = (pi_support.read_snapshot(self.session, member) or {}).get("instance")
         action = str(control.get("action") or "")
         keystrokes = [str(k) for k in (control.get("keystrokes") or []) if str(k)] or ([str(control.get("keystroke"))] if control.get("keystroke") else [])
         keystroke = " then ".join(keystrokes)
@@ -3544,7 +3605,9 @@ class Daemon:
         used = (rt.context or {}).get("used")
         rt.control_pending = {
             "action": action, "requested_by": control.get("requested_by") or "human",
-            "typed_ms": now, "used": used if isinstance(used, int) else None,
+            "typed_ms": now, "typed_at": submitted_at, "used": used if isinstance(used, int) else None,
+            "terminal_id": member.get("terminal_id"), "native_session": (member.get("session") or {}).get("value"),
+            "pi_previous_instance": pi_previous_instance,
             "session": roster.short_session(member.get("session")),
             "model": control.get("model"), "effort": control.get("effort"),
             "setting": control.get("setting"), "kind": control.get("kind") or member.get("kind"),
@@ -3878,6 +3941,20 @@ class Daemon:
                     team.name, name, "; ".join(repr(line) for line in after)))
             elif member is not None:
                 self._enqueue_briefing(team, member, now)
+            self.who_dirty = True
+            return
+        if state.get("kind") == "pi":
+            # Readiness proves a resumed process, not the requested model/effort.
+            # Wait for its fresh native report; a clamped thinking level must
+            # not be reported as successfully applied.
+            if rt.control_pending is not None:
+                rt.control_pending.update(action="model", kind="pi", restarted=True,
+                                          typed_at=time.time(),
+                                          brief_after=update.get("briefed_at", False) is None)
+            pending = team.pending.get(name)
+            if pending is not None and pending.control is not None:
+                pending.control["action"] = "model"
+            rt.context_read_ms = None
             self.who_dirty = True
             return
         self._control_observed(team, name, "restart", "session resumed", now)
@@ -4342,6 +4419,8 @@ class Daemon:
         snapshot.detection_text = self._read_detection(rt, str(member.get("pane_id")), self.now_ms())
         snapshot.detection_stable_since_ms = rt.detection_stable_since_ms
         snapshot.prompt_line = self._prompt_line(team, name, str(member.get("pane_id")), str(member.get("kind")), snapshot.detection_text)
+        if member.get("kind") == "pi" and snapshot.detection_text is None:
+            snapshot.detection_text = ""  # Distinguish a failed final read from the cheap preflight.
         # Gate 1 again: three socket round trips passed; the member may have run board --new meanwhile
         # (register: "Board read between gate and send -> cursor re-read immediately before the prompt").
         cursor = self._refresh_pending_seqs(team, name, pending)
@@ -4934,6 +5013,8 @@ class Daemon:
         if line is not None:
             return refuse("dialog", line)
         draft = self._prompt_line(team, name, pane_id, kind, detection)
+        if kind == "pi" and draft is None:
+            return refuse("draft", "Pi editor is not visible")
         if draft and draft.strip():
             return refuse("draft", draft.strip().splitlines()[0][:40])
         gate_seq = int(fresh.get("state_change_seq") or 0)

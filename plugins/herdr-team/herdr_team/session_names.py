@@ -31,7 +31,7 @@ def prepare(kind: str, name: str, args: Sequence[str]) -> Tuple[List[str], Dict[
     """Only fresh launches call this. No network discovery or native DB writes."""
     extra = list(args)
     entry: Dict[str, Any] = {"kind": kind, "title": name, "status": "pending", "created": time.time(), "attempts": 0}
-    if kind == "claude":
+    if kind in ("claude", "pi"):
         extra += ["--name", name]
     elif kind == "opencode":
         with socket.socket() as listener:
@@ -45,11 +45,11 @@ def prepare(kind: str, name: str, args: Sequence[str]) -> Tuple[List[str], Dict[
 
 
 def arm(paths: Any, member: Any, entry: Dict[str, Any], session: Optional[Dict[str, Any]] = None) -> None:
-    if entry["kind"] not in ("claude", "codex", "opencode"):
+    if entry["kind"] not in ("claude", "codex", "opencode", "pi"):
         return
     entry = dict(entry, terminal_id=member.terminal_id, generation=member.generation,
                  session_id=(session or member.session or {}).get("value"), awaiting_first_report=not bool(member.session))
-    if entry["kind"] == "claude":
+    if entry["kind"] in ("claude", "pi"):
         entry["status"] = "launch-option"
     save(paths, member.name, entry)
 
