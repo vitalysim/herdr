@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from herdr_team import SKILL_VERSION, VERSION
 from herdr_team import api as _api
+from herdr_team import store as _store
+from herdr_team import permissions as _permissions
 from herdr_team import models as _models
 from herdr_team import links as _links
 from herdr_team import charter as _charter
@@ -241,7 +243,7 @@ def _initial_member_documents(planned: Sequence[Tuple[str, str]], briefs: Dict[s
     missing: List[str] = []
     documents: Dict[str, str] = {}
     for name, role in planned:
-        explicit = instructions.get(name)
+        explicit = instructions.get(name) or instructions.get(role)  # by final name, or by role like --brief
         sections = _instructions_doc.parse(explicit)
         mission = _instructions_doc.mission_paragraph(sections)
         brief = (briefs.get(name) or briefs.get(role) or "").strip()
@@ -278,6 +280,7 @@ class _JoinSpec:
         self.initial_instructions: Optional[str] = None
         #: ``(model, effort)`` from ``create --model <name|role>=…``, recorded after the join.
         self.setting: Optional[Tuple[Optional[str], Optional[str]]] = None
+        self.permissions: Optional[str] = None
         self.resolved: Optional[_roster.ResolvedTarget] = None
         self.final_role: str = ""
         self.final_name: str = ""
@@ -534,7 +537,7 @@ def _spawn_member(layout: Layout, api: Any, team: _roster.Team, team_paths: Team
         workspace_id=pane_id.split(":")[0] if ":" in pane_id else None, tab_id=None, label=label, cwd=leaf.get("cwd"),
         brief=_roster._sanitize_brief(brief) if brief else None, managed=True, status="starting", generation=1, delivery="nudge",
         verified_kind=_roster._kind_verified(layout, kind), joined_at=_roster.now_iso(), last_seen_at=None,
-        model=leaf.get("model"), effort=leaf.get("effort"),
+        model=leaf.get("model"), effort=leaf.get("effort"), permissions=leaf.get("permissions"),
     )
     saved, _prev = roster.add_member(member, steal=args.steal, socket=os.fspath(layout.socket))
     team.members = saved.members
@@ -544,7 +547,7 @@ def _spawn_member(layout: Layout, api: Any, team: _roster.Team, team_paths: Team
         _charter.initialize_instructions(layout, team.team, author, member.name, initial_instructions)
     out: Dict[str, Any] = {"member": _member_json(member, False), "job": None}
     from . import session_names
-    launch_args = _models.launch_args(kind, leaf.get("launch_model"), leaf.get("launch_effort"))
+    launch_args = _models.launch_args(kind, leaf.get("launch_model"), leaf.get("launch_effort"), _permissions.effective(team.config, member))
     naming = None
     try:
         launch_args, naming = session_names.prepare(kind, name, launch_args)
@@ -645,9 +648,12 @@ def _add_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--new", action="store_true", help="lay out fresh panes and start agents (--spawn)")
     parser.add_argument("--workspace", metavar="ID", help="workspace for --new (default: the current one)")
     parser.add_argument("--spawn", action="append", default=[], metavar="ROLE:KIND[:CWD]")
+    parser.add_argument("--permissions", choices=_permissions.MODES, help="team launch default: yolo (default) or native agent settings")
+    parser.add_argument("--member-permissions", action="append", default=[], metavar="NAME|ROLE=MODE", help="per-member yolo/native override; repeat as needed")
     parser.add_argument("--manager", metavar="NAME", help="the member that coordinates the team (see: herdr-synapse manager)")
     parser.add_argument("--model", action="append", default=[], metavar="ROLE|KIND=MODEL[@EFFORT]",
                         help="a member's model and effort (by --spawn role), or the team default for a kind (claude=opus@medium, codex=gpt-5.6-luna@high)")
+    parser.add_argument("--template", metavar="NAME", help="start from a team template (herdr-synapse template list): charter, rules, roles, missions and settings; your own flags win")
 
 
 def parse_model_args(items: List[str]) -> Tuple[Dict[str, Tuple[Optional[str], Optional[str]]], Dict[str, Tuple[Optional[str], Optional[str]]]]:
@@ -682,6 +688,19 @@ def _run_create(args: argparse.Namespace) -> int:
     env = env_of(args)
     team_name = _paths.validate_team_name(args.team_pos)
     author = _create_author(args, layout, api, team_name)
+    template = None
+    template_notes: List[str] = []
+    if getattr(args, "template", None):
+        from herdr_team import templates as _templates
+
+        template = _templates.load(args.template, layout.config_dir)
+        template_notes = _templates.fill_create_args(args, template)
+        if template.source == "user":
+            template_notes.append("template {} is one of yours: {}".format(template.name, template.path))
+        _human_only(layout, team_name, author, "create --template")
+    # carried to ``_create_members``, which sets the manager and settings once the members exist
+    args._template = template
+    args._template_notes = template_notes
     if args.charter is not None and args.charter_file is not None:
         raise UsageError("pass --charter or --charter-file, not both")
     if args.charter is not None or args.charter_file is not None:
@@ -692,6 +711,11 @@ def _run_create(args: argparse.Namespace) -> int:
         _human_only(layout, team_name, author, "create --project/--rules/--instructions")
     if args.manager:
         _human_only(layout, team_name, author, "create --manager")
+    if args.permissions is not None or args.member_permissions:
+        _human_only(layout, team_name, author, "create --permissions/--member-permissions")
+    permission_members = _parse_brief_args(args.member_permissions, flag="--member-permissions")
+    for mode in permission_members.values():
+        _permissions.validate(mode)
     # Resolved before any write, so a bad path fails before the team exists.
     project_dir = _workdir.resolve_project_dir(args.project, state_root=layout.state_root.path) if args.project is not None else None
     instructions = _parse_brief_args(args.instructions, flag="--instructions")
@@ -709,6 +733,8 @@ def _run_create(args: argparse.Namespace) -> int:
     existing_models = {}
     if existing_paths.team_json.is_file():
         existing_config = _roster.load_team(existing_paths).config
+        if args.permissions is not None and args.permissions != _permissions.effective(existing_config, {}):
+            raise UsageError("change an existing team default with: permissions --default MODE; then create --reuse")
         existing_models = existing_config.get("models") if isinstance(existing_config.get("models"), dict) else {}
     args._model_defaults = model_defaults
 
@@ -775,17 +801,26 @@ def _run_create(args: argparse.Namespace) -> int:
     for spec in specs:
         spec.brief = briefs.get(spec.final_name) or briefs.get(spec.final_role)
         spec.initial_instructions = initial_documents[spec.final_name]
+        spec.permissions = permission_members.pop(spec.final_name, None) or permission_members.pop(spec.final_role, None)
     for leaf in spawn:
+        leaf["permissions"] = permission_members.pop(leaf["name"], None) or permission_members.pop(leaf["role"], None)
         leaf["initial_instructions"] = initial_documents[str(leaf["name"])]
+
+    if permission_members:
+        raise UsageError("--member-permissions names {}, which is not a member being added".format(", ".join(sorted(permission_members))))
+    if args.permissions is not None or args.member_permissions:
+        _permissions.ensure_current_daemon(layout, env)
 
     # Phase 2: writes.
     fresh = not existing_paths.team_json.is_file()
     team = _roster.create_team(layout, team_name, naming="plain" if names_plain else "prefixed", charter=None, reuse=args.reuse)
     team_paths = layout.team(team_name)
     if fresh:
-        team = _roster.update_team(team_paths, lambda doc: doc.config.update(document_sync="auto"))
+        team = _roster.update_team(team_paths, lambda doc: doc.config.update(document_sync="auto", permissions=args.permissions or "yolo"))
     try:
-        return _create_members(args, layout, api, env, author, team, team_paths, specs, spawn, briefs, names_plain, charter_body, known_before, project_dir, instructions)
+        with _store.FileLock(team_paths.root / "restore.lock", timeout=0, code="create_busy"):
+            team = _roster.load_team(team_paths)
+            return _create_members(args, layout, api, env, author, team, team_paths, specs, spawn, briefs, names_plain, charter_body, known_before, project_dir, instructions)
     except BaseException:
         if fresh and not agent_members(load_doc(team_paths)):
             shutil.rmtree(team_paths.root, ignore_errors=True)
@@ -814,7 +849,8 @@ def _apply_workdir_setup(
     if args.rules is not None or args.rules_file is not None:
         _charter.set_rules(layout, team_name, author, args.rules, args.rules_file)
 
-    live = {str(m.get("name")) for m in members_out}
+    # keyed by final name or by role, as ``_initial_member_documents`` applies them (templates key by role)
+    live = {str(m.get("name")) for m in members_out} | {str(m.get("role")) for m in members_out if m.get("role")}
     for name in (instructions or {}):
         if name not in live:
             out["warnings"].append("--instructions {}=…: no member of that name joined; skipped".format(name))
@@ -876,6 +912,13 @@ def _create_members(args: argparse.Namespace, layout: Layout, api: Any, env: Dic
             member, job = perform_join(layout, api, team, spec, args.steal, args.rename, env, author)
             if spec.setting is not None:
                 member = _record_setting(layout, team_name, member, spec.setting)
+            if spec.permissions is not None:
+                def set_permissions(doc: _roster.Team) -> None:
+                    row = doc.find(member.name)
+                    if row is None or row.status == "left":
+                        raise HerdrTeamError("member_not_found", "member changed while joining", EXIT_REFUSED)
+                    row.permissions = spec.permissions
+                member = _roster.update_team(team_paths, set_permissions).find(member.name)
             members_out.append(_member_json(member, spec.renamed))
             jobs.append(job)
     _ensure_daemon(layout, env)
@@ -891,6 +934,12 @@ def _create_members(args: argparse.Namespace, layout: Layout, api: Any, env: Dic
     elif default_team != team_name:
         warn(args, "default team stays {!r}; run: herdr-synapse use {}".format(default_team or (others[0] if others else "?"), team_name))
     manager_name = None
+    template = getattr(args, "_template", None)
+    template_notes = list(getattr(args, "_template_notes", None) or [])
+    if template is not None and not getattr(args, "manager", None):
+        from herdr_team import templates as _templates
+
+        args.manager = _templates.manager_for(template, members_out)
     if getattr(args, "manager", None):
         # After the members exist, and by name rather than by spec, so a member
         # Herdr renamed on the way in is still found.
@@ -902,6 +951,15 @@ def _create_members(args: argparse.Namespace, layout: Layout, api: Any, env: Dic
         audit(layout, team_name, "manager_set", author, {"member": manager_name, "previous": None})
     # After the roster exists, so the folder renders one file per member.
     workdir_result = _apply_workdir_setup(args, layout, team_name, team_paths, author, project_dir, instructions, members_out)
+    template_settings: Dict[str, Any] = {}
+    if template is not None:
+        from herdr_team import templates as _templates
+
+        template_settings = _templates.apply_settings(team_paths, template)
+        audit(layout, team_name, "template_applied", author, {"template": template.name, "settings": sorted(template_settings)})
+    saved_team = _roster.load_team(team_paths)
+    for item in members_out:
+        item["launch_permissions"] = _permissions.view(saved_team.config, saved_team.find(item["name"]))
     payload = {
         "manager": manager_name,
         "team": team_name, "team_dir": os.fspath(team_paths.root), "created": True, "members": members_out,
@@ -909,12 +967,15 @@ def _create_members(args: argparse.Namespace, layout: Layout, api: Any, env: Dic
         "notifier": notifier_state(layout.session), "default_team": set_default, "briefing_jobs": jobs,
         "pending": list(getattr(args, "_still_pending", []) or []), "failed": [m["name"] for m in failed],
         "project_dir": workdir_result.get("project_dir"), "team_folder": workdir_result.get("folder"),
+        "template": {"name": template.name, "settings": template_settings, "notes": template_notes} if template is not None else None,
     }
 
     def human() -> str:
         lines = ["team {} created ({} member{})".format(team_name, len(members_out), "" if len(members_out) == 1 else "s")]
         for m in members_out:
             lines.append("  {} ({}, {}) {}{}{}".format(m["name"], m["role"], m["kind"], m["pane_id"], " renamed" if m.get("renamed") else "", "" if m.get("status") in (None, "active") else " " + str(m.get("status"))))
+            policy = m["launch_permissions"]
+            lines.append("    launch permissions: {} ({}) — {}".format(policy["mode"], policy["source"], policy["effect"]))
         for pane_id in payload["pending"]:
             lines.append("  {} still starting; add it later".format(pane_id))
         if charter_doc:
@@ -923,6 +984,9 @@ def _create_members(args: argparse.Namespace, layout: Layout, api: Any, env: Dic
             lines.append("team folder: {}".format(payload["team_folder"]))
         for hint in workdir_result.get("hints") or []:
             lines.append(hint)
+        if template is not None:
+            lines.append("template {}: {}".format(template.name, ", ".join("{}={}".format(k, v if not isinstance(v, dict) else v.get("mode", v)) for k, v in template_settings.items() if k != "template") or "no settings"))
+            lines.extend(template_notes)
         lines.append("notifier: {}".format(payload["notifier"]))
         return "\n".join(lines)
 
@@ -1054,13 +1118,14 @@ _execvp = os.execvp
 def resume_plan(team_name: str, member: _roster.Member, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """What ``resume`` would run for ``member``: the argv (with its model and effort flags), the directory, and the recorded session."""
     model, effort = _models.effective_setting(config, member)
-    argv = _models.resume_argv(member.kind, member.session, model, effort)
+    argv = _models.resume_argv(member.kind, member.session, model, effort, _permissions.effective(config, member))
     cwd = member.cwd if isinstance(member.cwd, str) and member.cwd and os.path.isdir(member.cwd) else None
     return {
         "team": team_name, "member": member.name, "kind": member.kind,
         "session": dict(member.session or {}), "argv": argv, "command": " ".join(shlex.quote(a) for a in argv),
         "cwd": cwd, "cwd_missing": member.cwd if member.cwd and cwd is None else None,
         "model": model, "effort": effort, "setting": _models.label(model, effort),
+        "permissions": _permissions.view(config, member),
     }
 
 
@@ -1457,6 +1522,8 @@ def _run_rename(args: argparse.Namespace) -> int:
     member = team.find(args.old)
     if member is None or member.is_human or member.status == "left":
         raise HerdrTeamError("member_not_found", "{!r} is not an agent member of {!r}".format(args.old, team_name), EXIT_REFUSED, {"name": args.old, "roster": team.names()})
+    from herdr_team import swap
+    swap.require_available(member)
     new = _roster.validate_member_name(args.new)
     if member.pane_id:
         _roster.rename_agent(api, member.pane_id, new)
@@ -1566,6 +1633,9 @@ def _run_me(args: argparse.Namespace) -> int:
     payload.update({"model": own_model, "effort": own_effort, "setting": _models.label(own_model, own_effort),
                     "model_source": model_src, "effort_source": effort_src})
     payload["links"] = _links.summary(layout.session, team_name)
+    from herdr_team import work as _work
+
+    payload["work"] = _work.member_view(_work.load(team_paths), author.name)
     # The team folder is how an agent differentiated only by a file finds that
     # file. Both paths are absolute so a member outside the project can read them.
     project = _workdir.project_dir_of(doc)
@@ -1660,6 +1730,7 @@ def _who_payload(args: argparse.Namespace, layout: Layout, api: Any, team_name: 
             # From the roster rather than from ``who.json``, so a stale snapshot
             # written before the designation still names the right member.
             m["manager"] = bool(member_doc.get("manager"))
+            m["permissions"] = _permissions.view(doc.get("config"), member_doc)
     kinds = _who_kinds(layout, members)
     if args.role:
         members = [m for m in members if m.get("role") == args.role]
@@ -1674,6 +1745,11 @@ def _who_payload(args: argparse.Namespace, layout: Layout, api: Any, team_name: 
         "members": members,
         "kinds": kinds,
     }
+    from herdr_team import schedules as _schedules
+
+    timetable = _schedules.summary(team_paths, dict(args.env))
+    if timetable is not None:
+        payload["schedules"] = timetable  # only for a team that has any, so the usual payload is unchanged
     return payload
 
 
@@ -1694,7 +1770,12 @@ def _run_who(args: argparse.Namespace) -> int:
         warn(args, "cannot reach Herdr; showing roster state only")
 
     def human() -> str:
-        return _render.render_who(payload, team_name, ascii_only=args.ascii, brief=args.brief, role=None)
+        text = _render.render_who(payload, team_name, ascii_only=args.ascii, brief=args.brief, role=None)
+        if payload.get("schedules"):
+            from herdr_team import schedules as _schedules
+
+            text += "\n" + _schedules.summary_line(payload["schedules"])
+        return text
 
     return emit(args, payload, human)
 

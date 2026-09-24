@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from herdr_team import store
 from herdr_team.api import HerdrApi, scrub_env
-from herdr_team.roster import same_session, session_key, session_of, short_session, write_briefing_job
+from herdr_team.roster import remember_session, same_session, session_key, session_of, short_session, write_briefing_job
 from herdr_team.errors import HerdrTeamError
 from herdr_team.paths import Layout, TeamPaths, ensure_dir, ensure_session_dirs, resolve_layout, socket_allowed
 
@@ -207,7 +207,8 @@ def _update_members(team: TeamPaths, updates: Dict[str, Dict[str, Any]]) -> Opti
 
 
 def _members_on_pane(doc: Dict[str, Any], pane_id: str) -> List[Dict[str, Any]]:
-    return [m for m in doc.get("members", []) if isinstance(m, dict) and m.get("pane_id") == pane_id and m.get("kind") != "human" and m.get("status") in LIVE_STATUSES]
+    from herdr_team import swap
+    return [m for m in doc.get("members", []) if isinstance(m, dict) and not swap.active(m) and m.get("pane_id") == pane_id and m.get("kind") != "human" and m.get("status") in LIVE_STATUSES]
 
 
 def _member_by_session(doc: Dict[str, Any], session: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -461,6 +462,8 @@ def _reconcile_available(layout: Layout, api: Any, teams: Dict[str, Dict[str, An
     ``missing`` member waits for a detected kind), the same rule as
     ``roster.rehydrate_match`` and the daemon's reconcile.
     """
+    from herdr_team import swap
+    teams = {name: dict(doc, members=[m for m in doc.get("members", []) if not swap.active(m)]) for name, doc in teams.items()}
     if agent is None:
         # The agent was released (or the pane hosts a shell): members on that pane are missing.
         say("agent.get {} -> {}; members on the pane become missing".format(pane_id, code))
@@ -557,6 +560,9 @@ def _reconcile_available(layout: Layout, api: Any, teams: Dict[str, Dict[str, An
                 fields["generation"] = int(member.get("generation") or 1) + 1  # moved panes, memory intact
             if live_session is not None and not same_session(member.get("session"), live_session):
                 fields["session"] = live_session
+                history = remember_session(member.get("session_history"), member.get("session"), live_session)
+                if history is not None:
+                    fields["session_history"] = history  # keep the replaced conversation for search --history
                 if session_key(member.get("session")) is not None:
                     # A different session than recorded: a fresh agent, whether on the member's own
                     # terminal or on the pane a label or pane-id match found (same rule as the daemon).
@@ -728,13 +734,10 @@ def _cursor_seq(team: TeamPaths, name: str) -> int:
 
 
 def unread_for(team: TeamPaths, name: str, since_seq: int = 0) -> List[Dict[str, Any]]:
-    """Unread board context for ``name``: to it or ``all``, from someone else, past its cursor (and ``since_seq``).
+    """Unread board context for ``name`` past its cursor (and ``since_seq``): ``store.is_member_awareness``.
 
-    Retracted posts and retract records are excluded; ``nudged``/``toast``
-    system records never count, nor does a ``direct`` line the human typed
-    into the member or its ``typed`` outcome (``store.is_direct_line``).
-    Prompt-submit shows all remaining awareness; the Stop decision narrows it
-    to authored mail with ``store.is_member_mail``.
+    Retracted posts are excluded. Prompt-submit shows all of it; the Stop
+    decision narrows it to authored mail with ``store.is_member_mail``.
     """
     cursor, seen = _cursor_state(team, name)
     floor = max(cursor, since_seq)
@@ -742,20 +745,7 @@ def unread_for(team: TeamPaths, name: str, since_seq: int = 0) -> List[Dict[str,
         records = store.BoardStore(team).read(since_seq=floor, include_retracted=False)
     except HerdrTeamError:
         records = []
-    out: List[Dict[str, Any]] = []
-    for record in records:
-        if record.get("seq") in seen:
-            continue
-        if record.get("from") == name or store.is_direct_line(record):
-            continue
-        if record.get("kind") == "system" and record.get("event") in ("nudged", "toast"):
-            continue
-        to = record.get("to")
-        if isinstance(to, str):
-            to = [to]
-        if isinstance(to, list) and (name in to or "all" in to):
-            out.append(record)
-    return out
+    return [r for r in records if r.get("seq") not in seen and store.is_member_awareness(r, name)]
 
 
 def is_muted(team: TeamPaths, name: str, now: Optional[float] = None) -> bool:

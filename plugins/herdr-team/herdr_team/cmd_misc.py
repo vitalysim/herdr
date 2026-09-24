@@ -19,7 +19,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from herdr_team import asks as _asks
 from herdr_team import charter as _charter
@@ -69,10 +69,10 @@ VIEW_LABEL_MAX_TWO = 27
 FULL_SCREEN_KINDS = frozenset({"claude", "opencode", "codex", "kilo", "omp"})
 DEFAULT_MUTE = "10m"
 
-KEYS: Dict[str, str] = {"team-up": "prefix+t", "compose": "prefix+m", "console": "prefix+u", "toggle-view": "prefix+y", "usage": "prefix+i", "knowledge": "prefix+f"}
-KEY_DESCRIPTIONS: Dict[str, str] = {"team-up": "team up: pick agents", "compose": "post to the team board", "console": "open the team console", "toggle-view": "toggle the team agents view", "usage": "usage limits across agents", "knowledge": "team knowledge bases"}
+KEYS: Dict[str, str] = {"team-up": "prefix+t", "compose": "prefix+m", "console": "prefix+u", "toggle-view": "prefix+y", "usage": "prefix+i", "knowledge": "prefix+f", "mission": "prefix+d"}
+KEY_DESCRIPTIONS: Dict[str, str] = {"team-up": "team up: pick agents", "compose": "post to the team board", "console": "open the team console", "toggle-view": "toggle the team agents view", "usage": "usage limits across agents", "knowledge": "team knowledge bases", "mission": "mission control: what needs you across teams"}
 #: The order the bindings are printed in.
-KEY_ACTIONS = ("team-up", "compose", "console", "toggle-view", "usage", "knowledge")
+KEY_ACTIONS = ("team-up", "compose", "console", "toggle-view", "usage", "knowledge", "mission")
 
 #: The token a stale sidebar block is missing; ``doctor`` looks for it.
 COLOR_SLOT_TOKEN = "$team_c1"
@@ -416,6 +416,25 @@ def state_root_candidates(env: Dict[str, str], config_dir: Path, team_arg: Optio
     return out
 
 
+def pointer_warnings(config_dir: Path, env: Mapping[str, str]) -> List[str]:
+    """Name a pointer that sends this config dir somewhere other than its default.
+
+    The pointer outranks Herdr's derived state dir, so a stray one silently
+    hides every team from the plugin's panes and from the next daemon start.
+    """
+    try:
+        pointed = _paths.read_pointer(config_dir)
+        default = _paths.default_state_root(config_dir, env)
+    except HerdrTeamError:
+        return []
+    if pointed is None or os.path.realpath(os.fspath(pointed)) == os.path.realpath(os.fspath(default)):
+        return []
+    fix = "if your teams are not there, rewrite {} or delete it".format(_paths.pointer_file(config_dir))
+    if not pointed.is_dir():
+        return ["state pointer names {}, which does not exist; {}".format(pointed, fix)]
+    return ["state pointer redirects this config dir to {} instead of {}; {}".format(pointed, default, fix)]
+
+
 def _plugin_entry(plugins: Any, source: str) -> Dict[str, Any]:
     for entry in plugins or []:
         if isinstance(entry, dict) and entry.get("plugin_id") == PLUGIN_ID:
@@ -482,6 +501,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
         warnings.append("socket is not listed in allowed-sockets; hooks, actions, and daemon start are no-ops here")
     pointer_path = _paths.pointer_file(layout.config_dir)
     pointer = os.fspath(pointer_path) if pointer_path.exists() else None
+    warnings.extend(pointer_warnings(layout.config_dir, env))
     state_root = {"path": os.fspath(layout.state_root.path), "source": layout.state_root.source, "candidates": state_root_candidates(env, layout.config_dir, getattr(args, "team", None))}
     if not layout.state_root.path.exists():
         warnings.append("state root {} does not exist yet".format(layout.state_root.path))
@@ -509,6 +529,14 @@ def _run_doctor(args: argparse.Namespace) -> int:
             grant.get("member"), grant.get("team"),
             "until {}".format(grant["expires_at"]) if grant.get("expires_at") else "no expiry",
             grant.get("member"), grant.get("team")))
+    from herdr_team import remote as _remote
+
+    # Anything that sends board content off the machine is worth one line here.
+    warnings.extend(_remote.doctor_warnings(layout.config_dir))
+    try:
+        remote_view: Optional[Dict[str, Any]] = _remote.public_view(_remote.load_config(layout.config_dir), time.time())
+    except HerdrTeamError:
+        remote_view = None
     plugin = _plugin_state(args, layout, env, reachable=bool(herdr["reachable"]))
     if plugin.get("installed") is False:
         warnings.append("plugin {} is not installed".format(PLUGIN_ID))
@@ -568,7 +596,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
         "herdr": herdr, "socket": socket_info, "slug": layout.slug, "config_dir": os.fspath(layout.config_dir),
         "state_root": state_root, "pointer": pointer, "plugin": plugin, "toast_delivery": delivery, "toast_probe": toast_probe,
         "daemon": daemon, "teams": teams, "console": {"open": console_open, "pane_id": console.get("pane_id"), "lifecycle": console_lifecycle},
-        "warnings": warnings, "errors": errors,
+        "remote": remote_view, "warnings": warnings, "errors": errors,
     }
 
     def human() -> str:

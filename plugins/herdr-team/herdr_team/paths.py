@@ -132,6 +132,11 @@ def skill_file() -> Path:
     return plugin_root() / "skills" / PLUGIN_ID / "SKILL.md"
 
 
+def skill_guides_dir() -> Path:
+    """Role guides and references printed by ``skill get``: always the running CLI's own."""
+    return plugin_root() / "skill-guides"
+
+
 def home_dir(env: Mapping[str, str]) -> Path:
     home = env.get("HOME")
     if not home:
@@ -298,8 +303,26 @@ def read_pointer(config: Path) -> Optional[Path]:
     return Path(line)
 
 
+#: Sources that say where this installation keeps its state, and so may be
+#: recorded in the pointer. The others are per-process redirections: a test
+#: rig's ``HERDR_TEAM_STATE_DIR``, a pane's ``HERDR_TEAM_DIR``, or ``--team
+#: <path>``. The pointer is shared by every session under one config dir, so a
+#: rig driving a named session under the real ``~/.config/herdr`` once wrote
+#: its temporary root there, and every plugin pane and fresh daemon of the
+#: default session then resolved to an empty directory.
+POINTER_SOURCES = frozenset({STATE_SOURCE_PLUGIN, STATE_SOURCE_POINTER, STATE_SOURCE_XDG})
+
+
+def pointer_recordable(resolution: "StateRootResolution") -> bool:
+    """Whether ``resolution`` may be written to the shared pointer file."""
+    return resolution.source in POINTER_SOURCES
+
+
 def write_pointer(config: Path, state_root: Path) -> Path:
-    """Record ``state_root`` for this config dir; returns the pointer path."""
+    """Record ``state_root`` for this config dir; returns the pointer path.
+
+    Callers must check :func:`pointer_recordable` first.
+    """
     from herdr_team import store  # local import: store depends on this module
 
     target = pointer_file(config)

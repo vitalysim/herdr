@@ -36,7 +36,7 @@ from herdr_team.paths import MAX_ROLE_CHARS, MAX_TEAM_CHARS, ROLE_NAME_RE, TEAM_
 FILTERS = ("all", "to me", "requests", "human", "system", "teams", "team")
 SLASH_COMMANDS = (
     "/all", "/human", "/kind", "/reply", "/urgent", "/interrupt", "/interrupts", "/ref", "/retract", "/mute", "/unmute", "/pause",
-    "/nudge", "/focus", "/peek", "/who", "/context", "/compact", "/clear", "/model", "/team", "/links", "/link", "/unlink", "/wipe", "/asks", "/ask-policy", "/filter", "/as", "/use", "/charter", "/remove", "/export", "/help", "/quit",
+    "/nudge", "/focus", "/peek", "/who", "/context", "/search", "/compact", "/clear", "/model", "/permissions", "/swap", "/team", "/links", "/link", "/unlink", "/wipe", "/schedule", "/asks", "/ask-policy", "/filter", "/as", "/use", "/charter", "/remove", "/export", "/help", "/quit",
 )
 #: ``/`` menu rows: command -> (placeholder, what it does). Every entry in
 #: ``SLASH_COMMANDS`` must appear here; a test keeps the two in step, so a new
@@ -61,14 +61,18 @@ SLASH_USAGE = {
     "/asks": ("", "what is waiting on you"),
     "/ask-policy": ("[block|noblock] [8m]", "whether an agent waits for you, and how long"),
     "/context": ("[name]", "how full each member's context window is"),
+    "/search": ("words or \"a phrase\"", "search what members said and did in their own conversations"),
     "/compact": ("name", "ask a member to summarise its context"),
     "/clear": ("name", "throw away a member's context and brief it again"),
+    "/permissions": ("[name [yolo|native|inherit]] | --default yolo|native", "show or save next-launch permissions (YOLO is the default)"),
     "/model": ("name model[@effort] [--restart]", "set model/effort (Claude and OpenCode effort can apply live; other changes at resume or --restart)"),
+    "/swap": ("name kind [model[@effort]] | name --retry", "create a fresh agent to replace this member's agent, keeping its configuration"),
     "/team": ("other-team text", "post to a linked team (its manager is nudged)"),
     "/links": ("", "which teams this team is linked to, and their state"),
     "/link": ("other-team", "link this team to another (both need a manager)"),
     "/unlink": ("other-team", "break the link to another team"),
     "/wipe": ("[--purge] [reason]", "empty the board: posts move to the archive (--purge deletes them); asks first"),
+    "/schedule": ("[run|enable|disable <id>]", "the team's recurring posts and when each fires next; fire or switch one"),
     "/filter": ("[all|to me|requests|human|system]", "filter the feed"),
     "/as": ("label", "change the label your posts carry"),
     "/use": ("team", "switch to another team"),
@@ -1871,6 +1875,11 @@ def _parse_slash(head: str, rest: str, default_team: str) -> Intent:
             else:
                 return Intent("error", {"message": "usage: /ask-policy [block|noblock] [8m]"})
         return Intent("ask_policy", {"team": default_team, "block": block, "timeout": timeout})
+    if head == "/search":
+        # The whole rest is the query: its own quoting says what is a phrase.
+        if not rest.strip():
+            return Intent("error", {"message": 'usage: /search <words or "a phrase">'})
+        return Intent("search", {"query": rest.strip(), "team": default_team})
     if head == "/context":
         if len(args) > 1 or (args and not MEMBER_NAME_RE.match(args[0])):
             return Intent("error", {"message": "usage: /context [<name>]"})
@@ -1879,6 +1888,20 @@ def _parse_slash(head: str, rest: str, default_team: str) -> Intent:
         if len(args) != 1 or not MEMBER_NAME_RE.match(args[0]):
             return Intent("error", {"message": "usage: {} <name>".format(head)})
         return Intent(head[1:], {"member": args[0], "team": default_team, "confirm": False})
+    if head == "/swap":
+        from herdr_team.swap import KINDS
+        if len(args) == 2 and args[1] == "--retry":
+            return Intent("swap", {"member": args[0], "retry": True, "team": default_team})
+        if len(args) not in (2, 3) or not MEMBER_NAME_RE.match(args[0]) or args[1] not in KINDS:
+            return Intent("error", {"message": "usage: /swap <name> {} [model[@effort]], or /swap <name> --retry".format("|".join(KINDS))})
+        return Intent("swap", {"member": args[0], "kind": args[1], "setting": args[2] if len(args) == 3 else "", "team": default_team})
+    if head == "/permissions":
+        valid = (not args or (len(args) == 1 and MEMBER_NAME_RE.match(args[0]))
+                 or (len(args) == 2 and ((args[0] == "--default" and args[1] in ("yolo", "native"))
+                     or (MEMBER_NAME_RE.match(args[0]) and args[1] in ("yolo", "native", "inherit")))))
+        if not valid:
+            return Intent("error", {"message": "usage: /permissions [name [yolo|native|inherit]] | --default yolo|native"})
+        return Intent("permissions", {"args": list(args), "team": default_team})
     if head == "/model":
         words = [w for w in args if w]
         restart = "--restart" in words
@@ -1909,6 +1932,13 @@ def _parse_slash(head: str, rest: str, default_team: str) -> Intent:
         return Intent("wipe", {"team": default_team, "purge": purge, "reason": reason, "confirm": False})
     if head == "/links":
         return Intent("links", {"team": default_team})
+    if head == "/schedule":
+        # Read and operate only; a schedule is created with ``herdr-synapse schedule add``, whose flags do not fit one line here.
+        if not args or args == ["list"]:
+            return Intent("schedule", {"action": "list", "team": default_team})
+        if len(args) == 2 and args[0] in ("run", "enable", "disable") and re.match(r"^[a-z0-9][a-z0-9._-]{0,39}\Z", args[1]):
+            return Intent("schedule", {"action": args[0], "ref": args[1], "team": default_team})
+        return Intent("error", {"message": "usage: /schedule [run|enable|disable <id>]"})
     if head in ("/link", "/unlink"):
         if len(args) != 1 or not re.match(r"^[a-z][a-z0-9_-]{0,63}\Z", args[0]):
             return Intent("error", {"message": "usage: {} <other-team>".format(head)})
@@ -1953,7 +1983,7 @@ HELP_TEXT = (
     "!name text types only if that member stays idle (!!name permits working; !!all targets every agent) | @@path attaches a file (@@ lists files) | "
     "@name text | @role:r text | /all text | /human text | /kind k | /reply N | /urgent | /interrupt | /ref path | "
     "/retract N | /mute [name] [10m] | /unmute [name] | /pause | /nudge name [--force] | /focus name | "
-    "/peek name | /who | /context [name] | /compact name | /clear name | /filter [name] | /as label | /use team | /charter [set [--urgent] text] | /remove name | /export | /quit"
+    "/peek name | /who | /context [name] | /search words | /compact name | /clear name | /filter [name] | /as label | /use team | /charter [set [--urgent] text] | /remove name | /export | /quit"
 )
 
 
@@ -1965,7 +1995,7 @@ HELP_LINES = (
     "           a line that begins with ! never posts by itself; to post one, write /all !text",
     "menus:     / commands   @ names   @@ files   ! members   !! members + all   (up/down move, Tab picks, Esc hides)",
     "board:     /retract N   /filter [all|to me|requests|human|system]   Tab cycles   /who",
-    "members:   /peek name   /focus name   /nudge name [--force]   /remove name   /asks",
+    "members:   /peek name   /focus name   /nudge name [--force]   /remove name   /asks   /search words",
     "context:   /context [name]   /compact name   /clear name (throws it away, asks)   /ask-policy",
     "delivery:  /mute [name] [10m]   /unmute [name]   /pause [10m]   Esc clears the status or closes a box",
     "interrupt: /interrupt @name text (into a working turn)   /interrupts [off|on|kind,…] [--cooldown 10m]",
@@ -2084,11 +2114,13 @@ def _after_parse(model: ConsoleModel, intent: Intent) -> Intent:
             model.status = "error: {}".format(message)
             return Intent("error", {"message": message})
         return intent
-    if intent.kind in ("retract", "remove", "clear", "wipe"):
+    if intent.kind in ("retract", "remove", "clear", "wipe", "swap"):
         if intent.kind == "retract":
             what = "retract #{}".format(intent.args.get("seq"))
         elif intent.kind == "remove":
             what = "remove {}".format(intent.args.get("member"))
+        elif intent.kind == "swap":
+            what = ("retry the saved replacement for {}" if intent.args.get("retry") else "create a fresh agent for {} and close its old pane (configuration stays)").format(intent.args.get("member"))
         elif intent.kind == "wipe":
             what = ("delete every post on the board, its archive and its payloads (nothing is kept)" if intent.args.get("purge")
                     else "clear the board (every post moves to the archive; read positions are kept)")
@@ -2447,6 +2479,7 @@ class PickerModel:
     action_team: str = ""
     action_member: str = ""
     action_index: int = 0
+    swap_kind_index: int = 0
     #: A destructive action waiting for ``y``; mirrors ``ConsoleModel.pending_confirm``.
     pending_action: Optional["Intent"] = None
 
@@ -2591,6 +2624,7 @@ def tree_member(member: Dict[str, Any], charter: Optional[Dict[str, Any]] = None
         "manager": bool(member.get("manager")),
         "model": member.get("model"),
         "effort": member.get("effort"),
+        "swap": member.get("swap"),
         "agent_status": None,
     }
     if isinstance(charter, dict) and charter.get("seq") is not None:
@@ -2948,6 +2982,8 @@ def picker_apply_key(model: PickerModel, key: str) -> Optional[Intent]:
         return _goal_key(model, key)
     if model.stage == "model":
         return _model_key(model, key)
+    if model.stage in ("swap_kind", "swap_model"):
+        return _swap_key(model, key)
     if model.stage == "target":
         return _target_key(model, key)
     if model.stage == "name":
@@ -3629,7 +3665,7 @@ def _members_key(model: PickerModel, key: str) -> Optional[Intent]:
     return None
 
 
-PICKER_TEXT_STAGES = ("name", "charter", "rules", "members", "rename", "goal", "model")
+PICKER_TEXT_STAGES = ("name", "charter", "rules", "members", "rename", "goal", "model", "swap_model")
 
 #: The member action menu, in the order it is shown. ``{team}`` is filled in per member.
 ACTION_OPTIONS = (
@@ -3642,6 +3678,7 @@ ACTION_OPTIONS = (
     ("resume", "show the command that reopens its own session (herdr-synapse resume)"),
     ("manager", "make it the team manager"),
     ("model", "set its model and effort (Claude and OpenCode effort can apply live; other changes at resume)"),
+    ("swap", "swap agent: create a fresh replacement with this member's configuration"),
 )
 
 
@@ -3676,6 +3713,8 @@ def _action_refusal(action: str, member: Dict[str, Any]) -> Optional[str]:
 
 def _confirm_question(intent: "Intent") -> str:
     args = intent.args
+    if intent.kind == "member_swap":
+        return "create fresh {}{} for {} and close its old pane? Configuration stays; new conversation. y replaces, n cancels".format(args["kind"], " (" + args["setting"] + ")" if args.get("setting") else "", args["member"])
     if intent.kind == "member_remove":
         tail = "its team tokens and pane label are cleared" if args.get("keep_name") else "its team tokens, pane label and Herdr agent name are cleared"
         return "remove {} from {}? {} - y removes, n cancels".format(args.get("member"), args.get("team"), tail)
@@ -3698,6 +3737,14 @@ def _start_action(model: PickerModel, action: str) -> Optional[Intent]:
         return None
     name = str(member.get("name"))
     base = {"team": model.action_team, "member": name, "terminal_id": member.get("terminal_id")}
+    if action == "swap":
+        from herdr_team import swap
+        if swap.active(member):
+            return Intent("member_swap", dict(base, retry=True))
+        model.stage = "swap_kind"
+        model.swap_kind_index = 0
+        model.error = None
+        return None
     if action == "rename":
         model.stage = "rename"
         model.error = None
@@ -3748,7 +3795,7 @@ def _actions_key(model: PickerModel, key: str) -> Optional[Intent]:
         model.action_index = min(len(options) - 1, model.action_index + 1)
         return None
     if len(key) == 1 and key.isdigit():
-        number = int(key)
+        number = 10 if key == "0" else int(key)
         if 1 <= number <= len(options):
             model.action_index = number - 1
             return _start_action(model, options[number - 1][0])
@@ -3847,6 +3894,38 @@ def _model_key(model: PickerModel, key: str) -> Optional[Intent]:
             return None
         return Intent("member_model", {"team": model.action_team, "member": str(member.get("name")), "setting": text, "terminal_id": member.get("terminal_id")})
     edit_key(_TextView(model), key)
+    return None
+
+
+def _swap_key(model: PickerModel, key: str) -> Optional[Intent]:
+    from herdr_team import models, swap
+    from herdr_team.errors import HerdrTeamError
+    if key == "ESC":
+        model.stage = "actions" if model.stage == "swap_kind" else "swap_kind"
+        model.error = None
+    elif model.stage == "swap_kind":
+        if key in ("UP", "k"):
+            model.swap_kind_index = (model.swap_kind_index - 1) % len(swap.KINDS)
+        elif key in ("DOWN", "j"):
+            model.swap_kind_index = (model.swap_kind_index + 1) % len(swap.KINDS)
+        elif key == "ENTER":
+            model.stage = "swap_model"
+            _set_input(model, "")
+    elif key == "ENTER":
+        kind = swap.KINDS[model.swap_kind_index]
+        text = model.input.strip()
+        try:
+            if text:
+                models.validate(kind, *models.parse_setting(text))
+        except HerdrTeamError as err:
+            model.error = err.message
+            return None
+        intent = Intent("member_swap", {"team": model.action_team, "member": model.action_member, "kind": kind, "setting": text})
+        model.pending_action = intent
+        model.status = _confirm_question(intent)
+        model.error = None
+    else:
+        edit_key(_TextView(model), key)
     return None
 
 
@@ -4055,7 +4134,7 @@ def picker_lines(model: PickerModel, width: int = 70, height: int = 24) -> List[
             groups: List[List[str]] = []
             for i, (_key, label) in enumerate(action_options(model)):
                 pointer = ">" if i == model.action_index else " "
-                lead = "{} {}  ".format(pointer, i + 1)
+                lead = "{} {}  ".format(pointer, (i + 1) % 10)
                 groups.append(_wrap_picker_text(lead + label, width, " " * display_width(lead)))
             identity = " · ".join(str(p) for p in (
                 member.get("name"), member.get("role"), member.get("kind"), member.get("pane_id") or "-", member.get("agent_status") or "unknown") if p)
@@ -4064,12 +4143,12 @@ def picker_lines(model: PickerModel, width: int = 70, height: int = 24) -> List[
                 goal = str(member.get("brief") or "")
                 header.extend(_wrap_picker_text("goal: {}".format(headline(goal, max(20, width - 8))) if goal else "goal: (none yet)", width, "      "))
                 header.append("")
-            footer = _wrap_picker_text("type 1-9 | Up/Down move | Enter acts | Esc back", width, "  ")
+            footer = _wrap_picker_text("type 1-9 or 0 | Up/Down move | Enter acts | Esc back", width, "  ")
             reserved = int(bool(model.error or model.status))
             selected = min(model.action_index, len(groups) - 1)
             if len(header) + len(footer) + len(groups[selected]) + reserved > height:
                 header = _wrap_picker_text("Actions: {}".format(member.get("name") or model.action_member), width, "  ")
-                footer = _wrap_picker_text("1-9, arrows, Enter, Esc", width, "  ")
+                footer = _wrap_picker_text("1-9/0, arrows, Enter, Esc", width, "  ")
             option_height = max(1, height - len(header) - len(footer) - reserved)
             lines.extend(header)
             lines.extend(_option_window(groups, selected, option_height))
@@ -4084,6 +4163,19 @@ def picker_lines(model: PickerModel, width: int = 70, height: int = 24) -> List[
         lines.append("Goal for {} (its brief; up to {} characters, Ctrl-U clears, Esc goes back)".format(model.action_member, MAX_BRIEF_TOTAL_CHARS))
         lines.append("Enter saves it to the roster; the agent only sees it when you send it (action 3)")
         lines.append("goal:")
+        lines.append(INPUT_PROMPT + model.input)
+        has_input = True
+    elif model.stage == "swap_kind":
+        from herdr_team.swap import KINDS
+        lines.append("Create replacement for {}".format(model.action_member))
+        lines.append("Choose a new agent type. Its team configuration will carry over.")
+        for index, kind in enumerate(KINDS):
+            lines.append(("> " if index == model.swap_kind_index else "  ") + kind)
+        lines.append("Up/Down choose | Enter next | Esc back")
+    elif model.stage == "swap_model":
+        from herdr_team.swap import KINDS
+        lines.append("Fresh {} for {}".format(KINDS[model.swap_kind_index], model.action_member))
+        lines.append("Model[@effort], or leave empty for saved/team defaults. Enter reviews; Esc back.")
         lines.append(INPUT_PROMPT + model.input)
         has_input = True
     elif model.stage == "model":

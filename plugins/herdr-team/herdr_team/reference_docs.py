@@ -39,6 +39,7 @@ SECTION_MARKERS = {
 MODULE_TITLES = {
     "herdr_team.cmd_roster": "Teams and members",
     "herdr_team.cmd_restore": "Team restoration",
+    "herdr_team.cmd_swap": "Fresh agent replacements",
     "herdr_team.cmd_board": "Board, messages, and delivery",
     "herdr_team.cmd_misc": "Setup, controls, and maintenance",
     "herdr_team.cmd_update": "Plugin updates",
@@ -49,8 +50,17 @@ MODULE_TITLES = {
     "herdr_team.cmd_usage": "Usage limits",
     "herdr_team.cmd_asks": "Human asks",
     "herdr_team.cmd_knowledge": "Shared knowledge",
+    "herdr_team.cmd_permissions": "Launch permissions",
     "herdr_team.cmd_models": "Models and effort",
     "herdr_team.cmd_links": "Team-to-team links",
+    "herdr_team.cmd_search": "Transcript search",
+    "herdr_team.cmd_schedule": "Schedules",
+    "herdr_team.cmd_work": "Work items",
+    "herdr_team.cmd_facts": "Facts and contradictions",
+    "herdr_team.cmd_recall": "Recall",
+    "herdr_team.cmd_templates": "Templates",
+    "herdr_team.cmd_mission": "Mission control",
+    "herdr_team.cmd_remote": "Phone reach",
 }
 
 

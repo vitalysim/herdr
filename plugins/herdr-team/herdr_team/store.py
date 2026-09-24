@@ -274,9 +274,13 @@ SYSTEM_EVENTS = (
     "knowledge_updated", "instructions_updated", "instructions_edited", "knowledge_finding",
     "artifacts_changed", "project_set", "operator_granted", "operator_revoked",
     "context_high", "context_cleared", "context_compacted", "workdir_moved", "manager_changed",
-    "model_changed", "model_applied", "restart_failed",
+    "permissions_changed", "model_changed", "model_applied", "restart_failed", "agent_swapped", "swap_control_cancelled",
     "link_established", "link_broken", "link_read",
     "board_cleared",
+    # 0.19: work items, facts, schedules
+    "work_ready", "work_cancelled",
+    "fact_added", "fact_retired", "fact_disputed", "fact_conflict", "fact_resolved", "contradictions_changed",
+    "schedule_failed", "schedule_missed",
 )
 #: Every key of a stored record in file order (docs/cli.md section 10).
 RECORD_KEYS = (
@@ -380,6 +384,35 @@ def is_member_mail(record: Any, name: str) -> bool:
     if not isinstance(record, dict) or record.get("kind") not in MESSAGE_KINDS:
         return False
     if not isinstance(name, str) or not name or record.get("from") == name:
+        return False
+    targets = record.get("to") or []
+    if isinstance(targets, str):
+        targets = [targets]
+    return isinstance(targets, list) and (name in targets or "all" in targets)
+
+
+#: The daemon's notes about its own delivery. They are addressed to the member
+#: they concern (or to the human) but tell that reader nothing new.
+BOOKKEEPING_EVENTS = ("nudged", "toast")
+
+
+def is_bookkeeping(record: Any) -> bool:
+    return isinstance(record, dict) and record.get("kind") == "system" and record.get("event") in BOOKKEEPING_EVENTS
+
+
+def is_member_awareness(record: Any, name: str) -> bool:
+    """True for a record a member is shown as unread: ``board --new``, its unread counts, the prompt hook, ``ack``.
+
+    Everything addressed to ``name`` or ``all`` by someone else, system
+    events included, except retract records, direct lines, and delivery
+    bookkeeping. ``is_member_mail`` is the authored subset that the notifier
+    delivers and the Stop hook waits on. The caller drops retracted posts.
+    """
+    if not isinstance(record, dict) or not isinstance(name, str) or not name:
+        return False
+    if record.get("from") == name or record.get("kind") == "retract":
+        return False
+    if is_direct_line(record) or is_bookkeeping(record):
         return False
     targets = record.get("to") or []
     if isinstance(targets, str):
@@ -787,18 +820,22 @@ class BoardStore:
         if size < self.rotate_bytes:
             return None
         return self._archive_active_locked(first_seq, last_seq, "rotated",
-                                           "board rotated: archive/{} ({} through {})", {})
+                                           lambda segment: "board rotated: archive/{} ({} through {})".format(segment, first_seq, last_seq), {})
 
-    def _archive_active_locked(self, first_seq: int, last_seq: int, event: str, text: str, extra: Dict[str, Any]) -> Path:
+    def _archive_active_locked(self, first_seq: int, last_seq: int, event: str, text: Callable[[str], str], extra: Dict[str, Any]) -> Path:
         """Move the active file to ``archive/board.<a>-<b>.jsonl`` and start a fresh one with a system note.
 
         Seqs stay monotonic (``board.seq`` continues), so every cursor and tailer
-        keeps its meaning; ``text`` may name ``{}`` for the segment file, the
-        first and the last seq. Callers hold the lock.
+        keeps its meaning; ``text(segment_file_name)`` is the note. Callers hold the lock.
+
+        The note is built before anything moves, and never by formatting a
+        string again: ``wipe --reason`` with a ``{`` in it once raised after the
+        rename, leaving the board in the archive with no note and no fresh file.
         """
         ensure_dir(self.team.archive_dir)
         target = self.team.archive_segment(first_seq, last_seq)
         check_not_symlink(target)
+        note_text = text(target.name)
         os.rename(self.team.board_jsonl, target)
         try:
             dir_fd = os.open(self.team.root, os.O_RDONLY)
@@ -811,8 +848,7 @@ class BoardStore:
         self.rebuild_archive_index()
         next_seq = last_seq + 1
         write_json(self.team.board_seq, {"next": next_seq + 1, "active_first_seq": next_seq})
-        record = {"from": "system", "kind": "system", "event": event, "to": ["all"],
-                  "text": text.format(target.name, first_seq, last_seq)}
+        record = {"from": "system", "kind": "system", "event": event, "to": ["all"], "text": note_text}
         record.update({k: v for k, v in extra.items() if k not in record})
         note = normalize_record(record)
         note["seq"] = next_seq
@@ -837,14 +873,15 @@ class BoardStore:
             if tail_max:
                 first_seq = first or tail_max
                 count = tail_max - first_seq + 1
-                if purge:
-                    text = "board purged by {}: {} posts ({} through {}) deleted with the archive and payloads{}".format(
-                        by, count, first_seq, tail_max, "; " + reason if reason else "")
-                else:
-                    text = "board cleared by {}: {} posts ({} through {}) moved to archive/{{}}{}".format(
-                        by, count, first_seq, tail_max, "; " + reason if reason else "").replace("{{}}", "{}")
+                why = "; " + reason if reason else ""
+
+                def text(segment: str) -> str:
+                    if purge:
+                        return "board purged by {}: {} posts ({} through {}) deleted with the archive and payloads".format(by, count, first_seq, tail_max) + why
+                    return "board cleared by {}: {} posts ({} through {}) moved to archive/{}".format(by, count, first_seq, tail_max, segment) + why
+
                 extra = {"by": by, "reason": reason, "cleared_first_seq": first_seq, "cleared_last_seq": tail_max, "purge": bool(purge)}
-                target = self._archive_active_locked(first_seq, tail_max, "board_cleared", text if purge else text, extra)
+                target = self._archive_active_locked(first_seq, tail_max, "board_cleared", text, extra)
                 out.update({"records": count, "archived_to": None if purge else os.fspath(target), "note_seq": tail_max + 1})
             if purge:
                 for name in self._archive_filenames():
@@ -1226,7 +1263,16 @@ class Cursors:
             out["seq"] = max_seq
         return out
 
-    def advance(self, reader: str, seq: int, terminal_id: Optional[str], surfaced_by: str, seen: Optional[Iterable[int]] = None, touch: bool = False) -> Dict[str, Any]:
+    def advance(
+        self,
+        reader: str,
+        seq: int,
+        terminal_id: Optional[str],
+        surfaced_by: str,
+        seen: Optional[Iterable[int]] = None,
+        touch: bool = False,
+        hold_unread: bool = False,
+    ) -> Dict[str, Any]:
         """Move forward only; never backwards. ``reader`` is a member name or ``human@<label>``.
 
         ``seq`` is the highest seq the caller actually printed; it is clamped
@@ -1243,6 +1289,12 @@ class Cursors:
         max (the join sets it there) would otherwise never produce one.
         Observed in the sandbox on 2026-09-05: a Claude acked at seq 1 = 1,
         the file kept its join timestamp, and the daemon re-briefed it.
+
+        ``hold_unread`` (``ack``) stops the cursor right before the first
+        record ``reader`` has not been shown (``is_member_awareness``), decided
+        under the same lock as the write. Without it a post that arrived
+        between ``board --new`` and ``ack`` was marked read unseen, and the
+        daemon dropped its pending nudge.
         """
         path = self.path_for(reader)
         target = max(0, int(seq))
@@ -1252,6 +1304,8 @@ class Cursors:
             if target > max_seq:
                 target = max_seq
             current = self.get(reader)
+            if hold_unread:
+                target = min(target, self._first_unshown(reader, current) - 1)
             new_seq = max(target, current["seq"])
             new_seen = {s for s in set(current.get("seen") or []) | extra if s > new_seq}
             while new_seq + 1 in new_seen:
@@ -1269,6 +1323,23 @@ class Cursors:
         doc["warning"] = None
         doc["advanced"] = new_seq > current["seq"]
         return doc
+
+    def _first_unshown(self, reader: str, current: Dict[str, Any]) -> int:
+        """Seq of the first record past ``current`` that ``reader`` was never shown; board max + 1 when none."""
+        seen = set(current.get("seen") or [])
+        for record in self.board.read(since_seq=int(current["seq"]), include_retracted=False):
+            if record["seq"] not in seen and is_member_awareness(record, reader):
+                return int(record["seq"])
+        return self.board.max_seq() + 1
+
+    def unshown(self, reader: str) -> List[int]:
+        """Seqs past the cursor that ``reader`` was never shown (the ``ack`` report)."""
+        current = self.get(reader)
+        seen = set(current.get("seen") or [])
+        return [
+            int(r["seq"]) for r in self.board.read(since_seq=int(current["seq"]), include_retracted=False)
+            if r["seq"] not in seen and is_member_awareness(r, reader)
+        ]
 
     def all(self) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
@@ -1575,7 +1646,19 @@ class RosterStore:
         except (TypeError, ValueError):
             return 0
 
-    def _save_locked(self, doc: Dict[str, Any], expected_revision: Optional[int]) -> Dict[str, Any]:
+    def _save_locked(self, doc: Dict[str, Any], expected_revision: Optional[int], swap_id: Optional[str] = None) -> Dict[str, Any]:
+        # An unfinished replacement owns the member, even after its CLI exits.
+        # Other members and team documents may still change normally.
+        before = read_json(self.team.team_json, default={}) or {}
+        after_members = {m.get("name"): m for m in doc.get("members", [])}
+        for member in before.get("members", []):
+            operation = member.get("swap") or {}
+            if operation and operation.get("phase") not in ("complete", "cancelled") and operation.get("id") != swap_id:
+                after = after_members.get(member.get("name")) or {}
+                protected = ("name", "kind", "terminal_id", "pane_id", "workspace_id", "tab_id", "status", "generation", "session", "model", "effort", "permissions", "role", "manager", "swap")
+                if (any(after.get(key) != member.get(key) for key in protected)
+                        or (before.get("config") or {}).get("permissions") != (doc.get("config") or {}).get("permissions")):
+                    raise HerdrTeamError("swap_busy", "member has an unfinished swap; use swap --status or --retry", EXIT_REFUSED)
         current = self.current_revision()
         if expected_revision is not None and current is not None and current != expected_revision:
             raise HerdrTeamError(
@@ -1598,7 +1681,7 @@ class RosterStore:
         with team_lock(self.team):
             return self._save_locked(doc, expected_revision)
 
-    def update(self, mutate: Callable[[Dict[str, Any]], Any], retries: Optional[int] = None) -> Dict[str, Any]:
+    def update(self, mutate: Callable[[Dict[str, Any]], Any], retries: Optional[int] = None, swap_id: Optional[str] = None) -> Dict[str, Any]:
         """Lock, load, ``mutate(doc)`` in place, save; retries ``MAX_RETRIES`` on conflict."""
         attempts = max(1, int(retries if retries is not None else self.MAX_RETRIES))
         last: Optional[HerdrTeamError] = None
@@ -1611,7 +1694,7 @@ class RosterStore:
                     expected = 0
                 mutate(doc)
                 try:
-                    return self._save_locked(doc, expected)
+                    return self._save_locked(doc, expected, swap_id=swap_id)
                 except HerdrTeamError as err:
                     if err.code != "roster_conflict":
                         raise

@@ -54,8 +54,10 @@ from herdr_team import charter as _charter
 from herdr_team import identity as _identity
 from herdr_team import launch as _launch
 from herdr_team import links as _links
+from herdr_team import permissions as _permissions
 from herdr_team import models as _models
 from herdr_team import context as _context
+from herdr_team import remote as _remote
 from herdr_team import operator as _operator
 from herdr_team import usage as _usage
 from herdr_team import workdir as _workdir
@@ -145,6 +147,10 @@ OPENCODE_FRESH_TUI_MIN_WIDTH = 38
 #: How often a team's manager cursor is checked against the messages another
 #: team's manager sent it, so the sender's console can show ``read by``.
 LINK_RECEIPT_POLL_S = 5.0
+#: How often a half-finished cross-team send is looked for (``links.flush_outbox``).
+LINK_OUTBOX_POLL_S = 10.0
+#: How often debated disputes are checked for their escalation deadline.
+DISPUTE_POLL_S = 30.0
 #: A restart (``model --apply restart``) exits the agent and resumes its
 #: session with new flags. These bound each half so a member cannot sit in
 #: limbo: the exit keystroke must empty the pane, and the resumed agent must
@@ -178,6 +184,16 @@ SYSTEM_EVENT_DELIVERY: Dict[str, Dict[str, Any]] = {
     "link_broken": {"wake": "named"},
     "link_read": {},  # a receipt for the sending console; nobody is woken
     "board_cleared": {},  # visible on the board and in hook context; nobody is woken
+    "work_ready": {"wake": "named"},  # a dependency settled: the owner can start
+    "work_cancelled": {},
+    "fact_added": {},  # peer notes: awareness, never a wake
+    "fact_retired": {},
+    "fact_disputed": {},  # ``observe``: addressed to the human only, so no agent sees it
+    "fact_conflict": {"wake": "named", "toast": True},  # ``debate`` names the authors, ``escalate`` the manager or you
+    "fact_resolved": {},
+    "contradictions_changed": {},
+    "schedule_failed": {"toast": True},
+    "schedule_missed": {},
 }
 URGENT_SYSTEM_EVENTS = tuple(e for e, d in SYSTEM_EVENT_DELIVERY.items() if d.get("wake") == "all")
 NAMED_SYSTEM_EVENTS = tuple(e for e, d in SYSTEM_EVENT_DELIVERY.items() if d.get("wake") == "named")
@@ -635,6 +651,45 @@ def acquire_daemon_lock(session: SessionPaths, socket_path: Path, replace: bool,
     return lock, {"replaced": True, "holder": holder.to_json() if holder else None}
 
 
+#: ``request_stop`` reason of the version watcher; the one exit that restarts itself.
+STOP_MANIFEST_CHANGED = "manifest version changed"
+
+
+def restart_argv(daemon: "Daemon") -> Optional[List[str]]:
+    """The command a detached daemon execs after an upgrade exit, or None to stay down.
+
+    Only the version watcher's exit restarts: a plugin updated by ``git pull``
+    or ``herdr plugin install`` without ``daemon start --replace`` used to
+    leave the session with no notifier and nothing typed anywhere until
+    somebody noticed. ``daemon stop`` (the emergency stop), a disabled plugin,
+    a Herdr version refusal and an unreachable server all stay down; Herdr's
+    startup hook starts a fresh one when the server comes back.
+    """
+    if not getattr(daemon, "detached", False) or daemon.stop_reason != STOP_MANIFEST_CHANGED:
+        return None
+    if os.environ.get("HERDR_TEAM_NO_SELF_RESTART") == "1":
+        return None
+    launcher = plugin_root() / "bin" / "herdr-synapse"
+    if not os.access(os.fspath(launcher), os.X_OK):
+        return None
+    return [os.fspath(launcher), "daemon", "start"]
+
+
+def forget_self(session: SessionPaths) -> None:
+    """Drop ``daemon.json`` before the upgrade exec.
+
+    ``execv`` keeps the pid and the process start time, so the ``daemon start``
+    it becomes would find this very process "alive" in ``daemon.json`` and
+    report the notifier already running: the upgrade then left the session with
+    none at all (E2E, 2026-09-23). The lock is already released; nothing else
+    reads the file as authority.
+    """
+    try:
+        os.unlink(session.daemon_json)
+    except OSError:
+        pass
+
+
 def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_fd: Optional[int], allow_version: bool, dry_nudge: bool) -> None:
     """Runs in the detached grandchild; never returns."""
     session = layout.session
@@ -699,6 +754,13 @@ def _grandchild_main(layout: Layout, env: Dict[str, str], replace: bool, status_
             os.close(status_fd)
             status_fd = None
         exit_code = daemon.run()
+        argv = restart_argv(daemon)
+        if argv is not None:
+            # The lock is released; the new code starts its own notifier and this process ends.
+            log("restarting on the new code: {}".format(" ".join(argv)))
+            forget_self(session)
+            os.chdir(os.fspath(plugin_root()))
+            os.execv(argv[0], argv)
     except BaseException as err:  # noqa: BLE001 - the grandchild must never unwind into the parent's code
         try:
             _write_status(status_fd, {"status": "error", "error": {"code": "daemon_start_failed", "message": "{}: {}".format(type(err).__name__, err)}})
@@ -1327,6 +1389,8 @@ class TeamState:
     #: The raw ``config.gate`` value the current ``gate_config`` was built from (change detection).
     gate_overrides: Any = None
     gate_loaded: bool = False
+    #: ``schedules.Runner`` for this team's timetable, created at the first ``run_schedules``.
+    schedules: Any = None
 
     def members(self) -> List[Dict[str, Any]]:
         return [m for m in self.roster.get("members", []) if isinstance(m, dict)]
@@ -1392,6 +1456,8 @@ class Daemon:
         self.allow_version = allow_version
         self.clock = clock or time.monotonic
         self.sleep = sleep or time.sleep
+        #: Schedules fire on the calendar, so they need the wall clock; ``clock`` stays monotonic (tests swap both).
+        self.wall_clock: Callable[[], float] = time.time
         self.session = layout.session
         self.lock: Optional[store.FileLock] = None
         self.detached = False
@@ -1423,6 +1489,8 @@ class Daemon:
         self.last_agent_list_ms: Optional[float] = None
         self.stability: Dict[str, Stability] = {}
         self.global_last_nudge_ms: Optional[float] = None
+        self.link_outbox_ms: Optional[float] = None
+        self.disputes_ms: Optional[float] = None
         self.pair_exchanges: Dict[Tuple[str, str], List[float]] = {}
         self.notifications: List[Notification] = []
         self.toasts_disabled = False
@@ -1434,6 +1502,8 @@ class Daemon:
         self.next_toast_ms = 0.0
         #: When the asks phase may next look; also the popup back-off.
         self.ask_next_ms: Optional[float] = None
+        #: Phone reach (``herdr_team.remote``): idle and I/O-free until ``remote.json`` exists.
+        self.remote = _remote.RemoteRelay(layout, log=self.log)
         self.who_dirty = True
         self.last_who_ms: Optional[float] = None
         self.last_heartbeat_ms: Optional[float] = None
@@ -1829,6 +1899,8 @@ class Daemon:
             self._phase("console_reconcile", self._reconcile_console_after_connect)
         if self.reconcile_due or self._reconcile_poll_due(now):
             self._phase("reconcile", self.reconcile)
+        # Before the tail, so a scheduled post is ingested and its nudges queued in the same tick.
+        self._phase("schedules", lambda: self.run_schedules(now))
         self._phase("tail_boards", self.tail_boards)
         self._phase("consume_jobs", lambda: self.consume_jobs(now))
         self._phase("restarts", lambda: self.advance_restarts(now))
@@ -1838,6 +1910,10 @@ class Daemon:
         self._phase("asks", lambda: self.raise_asks(now))
         self._phase("sweep_unread", lambda: self.sweep_all_unread(now))
         self._phase("link_receipts", lambda: self.poll_link_receipts(now))
+        self._phase("link_outbox", lambda: self.flush_link_outbox(now))
+        self._phase("disputes", lambda: self.escalate_disputes(now))
+        # After ``asks`` so ``open_asks`` is current; the HTTP runs on the relay's own thread.
+        self._phase("remote", lambda: self.remote.tick(self.teams, now))
         self._phase("board_snapshot", lambda: self.snapshot_all_boards(now))
         self._phase("session_names", self.poll_session_names)
         self._phase("evaluate_pending", self.evaluate_pending)
@@ -1870,7 +1946,7 @@ class Daemon:
             return
         if self.manifest_seen == current:
             self.log("manifest version changed {} -> {} (two identical reads); exiting after the current delivery".format(self.manifest_version, current))
-            self.request_stop("manifest version changed")
+            self.request_stop(STOP_MANIFEST_CHANGED)
         else:
             self.manifest_seen = current
 
@@ -1940,6 +2016,16 @@ class Daemon:
     def _reload_roster(self, team: TeamState) -> None:
         doc = _load_roster_doc(team.paths)
         if doc is not None:
+            from herdr_team import swap
+            for member in doc.get("members", []):
+                name = str(member.get("name"))
+                previous = team.member(name) or {}
+                if member.get("swap") and ((previous.get("swap") or {}).get("id") != member["swap"].get("id") or previous.get("kind") != member.get("kind")):
+                    # Never carry a landed control, probe, or usage observation into a replacement.
+                    pending = team.pending.get(name)
+                    if pending is not None and pending.kind != "nudge":
+                        team.pending.pop(name, None)
+                    team.runtime.pop(name, None)
             revision = int(doc.get("revision") or 0)
             repair_result = _workdir.repair_creation_scaffolds(self.layout, team.name) if team.scaffold_repair_revision != revision else []
             if repair_result is not None:
@@ -2234,37 +2320,20 @@ class Daemon:
         added: Dict[str, List[int]] = {}
         for rec in records:
             seq = int(rec["seq"])
-            if seq in retracted or rec.get("kind") == "retract" or isinstance(rec.get("retracts"), int) or store.is_direct_line(rec) or not self._counts_for_nudges(rec):
+            if seq in retracted or store.is_direct_line(rec) or not self._counts_for_nudges(rec):
                 continue
             author = str(rec.get("from"))
-            urgent = bool(rec.get("urgent"))
-            targets: List[str] = []
-            if author == "system":
-                if rec.get("event") in URGENT_SYSTEM_EVENTS and urgent:
-                    newcomer = rec.get("member") if rec.get("event") == "member_joined" else None
-                    targets = [n for n in cursors if n != newcomer]
-            else:
-                for target in rec.get("to", []) or []:
-                    if not isinstance(target, str) or target == author or target == "human":
-                        continue
-                    if target == "all":
-                        if urgent or author == "human":
-                            targets.extend(cursors)
-                        continue
-                    recipient = team.member(target) or team.member_by_retired_name(target)
-                    if recipient is not None:
-                        targets.append(str(recipient.get("name")))
-            for name in targets:
+            for name, urgent, interrupt in self._nudge_targets(team, rec):
                 if name == author or name not in cursors:
                     continue
                 cursor, seen = cursors[name]
                 if seq <= cursor or seq in seen or seq in team.delivery_terminal.get(name, set()):
                     continue
-                self._add_pending(team, name, seq, urgent, author, now, interrupt=bool(rec.get("interrupt")))
+                self._add_pending(team, name, seq, urgent, author, now, interrupt=interrupt)
                 added.setdefault(name, []).append(seq)
         if not added:
             return
-        landed_results = (RESULT_LANDED_WORKING, RESULT_DRY)
+        landed_results = (RESULT_LANDED_WORKING, RESULT_LANDED_IN_TURN, RESULT_DRY)
         attempts = [a for a in team.ledger.attempts().values() if a.get("result") in landed_results and a.get("member") in added]
         for name, seqs in added.items():
             pending = team.pending.get(name)
@@ -2287,10 +2356,17 @@ class Daemon:
         self.who_dirty = True
 
     def _replay_ledger(self, team: TeamState) -> None:
+        """An intent with no result was sent by a notifier that stopped before recording it: count it as sent, once.
+
+        The result is written here, so the intent is closed. Left open, every
+        later restart replayed it again and swallowed that member's next
+        nudge, whatever posts it was about.
+        """
         for entry in team.ledger.open_intents():
             member = entry.get("member")
             if isinstance(member, str):
                 team.open_intents[member] = entry
+                team.ledger.record_result(str(entry.get("id")), RESULT_LANDED_WORKING, {"assumed": "the previous notifier stopped before recording a result"})
         if team.open_intents:
             self.log("team {}: {} open intents count as sent".format(team.name, len(team.open_intents)))
 
@@ -2521,6 +2597,9 @@ class Daemon:
         members: List[roster.Member] = []
         by_name: Dict[str, Dict[str, Any]] = {}
         for raw in team.members():
+            from herdr_team import swap
+            if swap.active(raw):
+                continue
             name = raw.get("name")
             if not isinstance(name, str) or not name or raw.get("kind") == "human" or raw.get("status") == "left":
                 continue
@@ -2556,6 +2635,9 @@ class Daemon:
         live_session = roster.session_of(match)
         if live_session is not None and not roster.same_session(member.get("session"), live_session):
             update["session"] = live_session
+            history = roster.remember_session(member.get("session_history"), member.get("session"), live_session)
+            if history is not None:
+                update["session_history"] = history  # keep the replaced conversation for search --history
         return update
 
     def _ids_update(self, team: TeamState, member: Dict[str, Any], match: Dict[str, Any]) -> Dict[str, Any]:
@@ -2932,7 +3014,7 @@ class Daemon:
         if not render.is_unverified(rec):
             return True
         origin = rec.get("origin") if isinstance(rec.get("origin"), dict) else {}
-        return rec.get("from") == "human" and _identity.human_origin_ok(origin)
+        return rec.get("from") == "human" and _identity.record_human_ok(origin)
 
     def _unread_mail_seqs(self, team: TeamState, name: str, retry_terminal: bool = False) -> List[int]:
         """Authored unread mail eligible for automatic delivery to ``name``.
@@ -2981,20 +3063,10 @@ class Daemon:
                 self.log("{}: board cleared at #{}; asks, link inbox and pending nudges dropped".format(team.name, seq))
             if event in TOAST_SYSTEM_EVENTS and "human" in [t for t in (rec.get("to") or []) if isinstance(t, str)]:
                 team.human_queue.append(rec)
-            if event in NAMED_SYSTEM_EVENTS:
-                # Addressed to particular members: each gets an ordinary nudge,
-                # every gate applying, so "you are at 90%, finish and compact"
-                # arrives at that member's next idle rather than never.
-                for target in [t for t in (rec.get("to") or []) if isinstance(t, str) and t not in ("all", "human")]:
-                    named = team.member(target)
-                    if named is not None and named.get("kind") != "human" and named.get("terminal_id"):
-                        self._add_pending(team, str(named["name"]), seq, False, "system", now)
-            if rec.get("urgent") and event in URGENT_SYSTEM_EVENTS:
-                # An urgent system broadcast nudges every member; a join spares the newcomer (its briefing covers it).
-                newcomer = rec.get("member") if event == "member_joined" else None
-                for member in team.members():
-                    if member.get("kind") != "human" and member.get("terminal_id") and member.get("name") != newcomer:
-                        self._add_pending(team, str(member["name"]), seq, True, "system", now)
+            if event in _remote.RELAYED_EVENTS:
+                self.remote.note_record(team.name, rec)
+            for name, urgent, _interrupt in self._nudge_targets(team, rec):
+                self._add_pending(team, name, seq, urgent, "system", now)
             return
         if kind == "direct":
             # A line the human typed into one member (``say``): already in its input box, never a nudge.
@@ -3022,13 +3094,46 @@ class Daemon:
             rt = team.rt(author)
             rt.last_post = rec
             rt.last_headline = task_headline(member, rec, time.time())
-        recipients = [str(t) for t in rec.get("to", []) if isinstance(t, str)]
+        if "human" in [t for t in rec.get("to", []) if isinstance(t, str)] and author != "human":
+            team.human_queue.append(rec)
+        for name, urgent, interrupt in self._nudge_targets(team, rec):
+            self._add_pending(team, name, seq, urgent, author, now, interrupt=interrupt)
+
+    def _nudge_targets(self, team: TeamState, rec: Dict[str, Any]) -> List[Tuple[str, bool, bool]]:
+        """``(member, urgent, interrupt)`` for each member a verified record nudges.
+
+        The one routing table for the live tail and the cold-start rebuild, so
+        a restart requeues exactly what the running daemon would have. The
+        rebuild once had its own copy that forgot manager broadcasts and
+        member-named system events (a context warning, a model change), so a
+        restart silently dropped them.
+        """
+        author = rec.get("from")
+
+        def agents(exclude: Set[Any]) -> List[str]:
+            return [str(m["name"]) for m in team.members() if m.get("kind") != "human" and m.get("terminal_id") and m.get("name") not in exclude]
+
+        out: List[Tuple[str, bool, bool]] = []
+        if author == "system":
+            event = rec.get("event")
+            if event in NAMED_SYSTEM_EVENTS:
+                # Addressed to particular members: each gets an ordinary nudge,
+                # every gate applying, so "you are at 90%, finish and compact"
+                # arrives at that member's next idle rather than never.
+                for target in [t for t in (rec.get("to") or []) if isinstance(t, str) and t not in ("all", "human")]:
+                    named = team.member(target)
+                    if named is not None and named.get("kind") != "human" and named.get("terminal_id"):
+                        out.append((str(named["name"]), False, False))
+            if rec.get("urgent") and event in URGENT_SYSTEM_EVENTS:
+                # An urgent system broadcast nudges every member; a join spares the newcomer (its briefing covers it).
+                out.extend((name, True, False) for name in agents({rec.get("member") if event == "member_joined" else None}))
+            return out
+        if rec.get("kind") in ("direct", "retract") or isinstance(rec.get("retracts"), int):
+            return out
         urgent = bool(rec.get("urgent"))
         interrupt = bool(rec.get("interrupt"))  # ``post --interrupt``: named recipients only (the CLI refuses ``all``)
-        for target in recipients:
-            if target == "human":
-                if author != "human":
-                    team.human_queue.append(rec)
+        for target in [str(t) for t in rec.get("to", []) if isinstance(t, str)]:
+            if target in ("human", author):
                 continue
             if target == "all":
                 # The operator addressing the whole team is heard by every member (normal holds apply),
@@ -3036,16 +3141,12 @@ class Daemon:
                 # agent's broadcast waits for the next board read unless it is urgent. Measured on a live
                 # team, that wait ran to a median of 42 minutes, which is not a way to hand out scope.
                 if urgent or author == "human" or author == team.manager_name():
-                    for m in team.members():
-                        if m.get("kind") != "human" and m.get("name") != author and m.get("terminal_id"):
-                            self._add_pending(team, str(m["name"]), seq, urgent, author, now)
-                continue
-            if target == author:
+                    out.extend((name, urgent, False) for name in agents({author}))
                 continue
             recipient = team.member(target) or team.member_by_retired_name(target)  # old names resolve for 10 min
-            if recipient is None:
-                continue
-            self._add_pending(team, str(recipient.get("name")), seq, urgent, author, now, interrupt=interrupt)
+            if recipient is not None:
+                out.append((str(recipient.get("name")), urgent, interrupt))
+        return out
 
     def _track_ask(self, team: TeamState, rec: Dict[str, Any]) -> None:
         """Keep ``team.open_asks`` current from the records already flowing past.
@@ -3091,6 +3192,60 @@ class Daemon:
         for rec in records:
             if isinstance(rec.get("seq"), int) and rec["seq"] > cursor:
                 self._track_link(team, rec)
+
+    def escalate_disputes(self, now: float) -> None:
+        """``debate`` mode: a dispute its parties have not settled in time goes to the manager or the human.
+
+        The only thing the notifier does about contradictions. It never holds,
+        filters or delays a post; it adds one ``fact_conflict`` record for the
+        decider once the debate window has passed.
+        """
+        if self.disputes_ms is not None and now - self.disputes_ms < DISPUTE_POLL_S * 1000.0:
+            return
+        self.disputes_ms = now
+        from herdr_team import facts as _facts
+
+        for team in list(self.teams.values()):
+            if not _facts.facts_jsonl(team.paths).exists():
+                continue
+            config = _facts.contradictions_config(team.roster)
+            state = _facts.load(team.paths)
+            for dispute in _facts.due_for_escalation(state, config["debate_timeout_ms"]):
+                parties = [state.facts[f] for f in dispute.facts if f in state.facts]
+                authors = sorted({f.author for f in parties})
+                manager = team.manager_name()
+                decider = manager if manager and manager not in authors else "human"
+                if _facts.escalate(team.paths, dispute.id, decider) is None:
+                    continue
+                claims = "; ".join("{} ({}) says {!r}".format(f.id, f.author, _facts.clip(f.statement, 120)) for f in parties)
+                text = "{}: {} did not settle their disagreement about {}{} in time: {}. Decide with: herdr-synapse fact resolve {} --keep <fact> (or --keep-both / --retire-all)".format(
+                    dispute.id, " and ".join(authors), dispute.about or "?", " · " + dispute.attribute if dispute.attribute else "", claims, dispute.id)
+                self._append_system(team, "fact_conflict", text, [decider], {"dispute": dispute.id, "facts": list(dispute.facts), "mode": dispute.mode, "escalated": True})
+                self.log("{}: dispute {} escalated to {}".format(team.name, dispute.id, decider))
+
+    def flush_link_outbox(self, now: float) -> None:
+        """Finish a cross-team send that stopped between its two boards (``links.flush_outbox``)."""
+        if self.link_outbox_ms is not None and now - self.link_outbox_ms < LINK_OUTBOX_POLL_S * 1000.0:
+            return
+        self.link_outbox_ms = now
+        from herdr_team import links as _links
+
+        for report in _links.flush_outbox(self.layout.session):
+            self.log("link message {}: completed {} dropped {} pending {}".format(
+                report.get("id"), report.get("appended"), report.get("dropped"), report.get("pending")))
+
+    def run_schedules(self, now: float) -> None:
+        """Fire each team's due schedules (``herdr_team.schedules.Runner``; cheap when nothing is due)."""
+        from herdr_team import schedules as _schedules
+
+        wall = self.wall_clock()
+        for team in list(self.teams.values()):
+            if team.schedules is None:
+                team.schedules = _schedules.Runner(self.layout, team.name, self.env, log=self.log)
+            try:
+                team.schedules.tick(wall, now / 1000.0)
+            except HerdrTeamError as err:
+                self.log("{}: schedules: {}".format(team.name, err))
 
     def poll_link_receipts(self, now: float) -> None:
         """Tell the sending team's board when this team's manager has read a linked message."""
@@ -3429,6 +3584,9 @@ class Daemon:
             self._append_system(team, "typed", "{} of {} refused: {}".format(action, name, problem), ["human"], {"member": name})
             return
         control_doc = (record or {}).get("control") if isinstance((record or {}).get("control"), dict) else {}
+        latest_doc = store.RosterStore(team.paths).load()
+        latest_member = next((m for m in latest_doc.get("members", []) if m.get("name") == name), member)
+        mode = _permissions.effective(latest_doc.get("config"), latest_member)
         extra: Dict[str, Any] = {}
         if action == "model":
             # The lines come from the record, which the origin check above vouched for.
@@ -3457,10 +3615,10 @@ class Daemon:
             kind = str(member.get("kind") or "")
             try:
                 expected_exit = _models.exit_keystroke(kind)
-                safe_preserved = _models.preserved_launch_args(kind, [kind] + preserved)
+                safe_preserved = _models.preserved_launch_args(kind, [kind] + preserved, mode)
                 expected_argv = _models.restart_argv(
                     kind, member.get("session"), control_doc.get("model"), control_doc.get("effort"),
-                    [kind] + preserved,
+                    [kind] + preserved, permissions=mode,
                 )
             except HerdrTeamError:
                 expected_exit, expected_argv, safe_preserved = "", [], []
@@ -3470,7 +3628,7 @@ class Daemon:
                 self._append_system(team, "typed", "restart of {} refused: control does not match its recorded session and setting".format(name), ["human"], {"member": name})
                 return
             lines = [exit_key]
-            extra = {"model": control_doc.get("model"), "effort": control_doc.get("effort"), "argv": argv,
+            extra = {"permissions": mode, "model": control_doc.get("model"), "effort": control_doc.get("effort"), "argv": argv,
                      "preserved": preserved, "after": after, "session": member.get("session")}
         else:
             try:
@@ -3483,9 +3641,9 @@ class Daemon:
             if action == "clear" and kind == "opencode":
                 model, effort = _models.effective_setting(team.roster.get("config"), member)
                 current_argv = self._foreground_argv(member)
-                extra = {"fresh_restart": True, "model": model, "effort": effort,
+                extra = {"fresh_restart": True, "permissions": mode, "model": model, "effort": effort,
                          "setting": _models.label(model, effort),
-                         "argv": _models.fresh_argv(kind, model, effort, current_argv),
+                         "argv": _models.fresh_argv(kind, model, effort, current_argv, permissions=mode),
                          "after": _models.post_start_keystrokes(kind, effort)}
         pending = Pending(first_ms=now, kind="control", lines=list(lines), force=True, seqs=[])
         pending.control = dict({"action": action, "keystroke": lines[0], "keystrokes": list(lines), "requested_by": (record or {}).get("from"), "kind": member.get("kind")}, **extra)
@@ -3508,7 +3666,14 @@ class Daemon:
         if not isinstance(record.get("control"), dict):
             return "record carries no control block"
         origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
-        if origin.get("verified") is not True:
+        if record.get("from") == "human":
+            # The operator's rule, the one the CLI's gate already applied: console, popup,
+            # a verified shell, or outside Herdr. Requiring ``verified`` here refused the
+            # outside-shell route the README recommends, after the CLI said "queued" (E2E,
+            # 2026-09-23). Notifier-written origins (schedule, remote) never qualify.
+            if not _identity.human_origin_ok(origin):
+                return "record origin is unverified"
+        elif origin.get("verified") is not True:
             return "record origin is unverified"
         return None
 
@@ -3537,6 +3702,12 @@ class Daemon:
 
             pi_previous_instance = (pi_support.read_snapshot(self.session, member) or {}).get("instance")
         action = str(control.get("action") or "")
+        if action == "restart" or control.get("fresh_restart"):
+            doc = store.RosterStore(team.paths).load()
+            row = next((m for m in doc.get("members", []) if m.get("name") == name), {})
+            if _permissions.effective(doc.get("config"), row) != control.get("permissions", "yolo"):
+                self._finish_pending(team, name, pending, "typed", "{} of {} refused: permissions changed; request it again".format(action, name))
+                return
         keystrokes = [str(k) for k in (control.get("keystrokes") or []) if str(k)] or ([str(control.get("keystroke"))] if control.get("keystroke") else [])
         keystroke = " then ".join(keystrokes)
         pane_id = str(snapshot.pane_id or member.get("pane_id") or "")
@@ -3621,13 +3792,13 @@ class Daemon:
             rt.restart = {"phase": "exiting", "since_ms": now, "argv": list(control.get("argv") or []), "kind": str(member.get("kind") or ""),
                           "pane_id": pane_id, "model": control.get("model"), "effort": control.get("effort"),
                           "after": list(control.get("after") or []), "requested_by": rt.control_pending["requested_by"],
-                          "session": control.get("session")}
+                          "session": control.get("session"), "permissions": control.get("permissions", "yolo")}
         elif action == "clear" and control.get("fresh_restart"):
             rt.restart = {"phase": "exiting", "since_ms": now, "action": "clear",
                           "argv": list(control.get("argv") or []), "kind": str(member.get("kind") or ""),
                           "pane_id": pane_id, "model": control.get("model"), "effort": control.get("effort"),
                           "after": list(control.get("after") or []), "requested_by": rt.control_pending["requested_by"],
-                          "session": member.get("session")}
+                          "session": member.get("session"), "permissions": control.get("permissions", "yolo")}
         elif action == "model" and not control.get("model"):
             # Effort alone has no observable: the transcript records the model,
             # not the thinking budget. Typed is as far as this can be proven.
@@ -3806,6 +3977,13 @@ class Daemon:
 
     def _advance_restart(self, team: TeamState, name: str, rt: MemberRuntime, now: float) -> None:
         """One step of exit -> start -> wait for the session to come back."""
+        from herdr_team import swap
+        latest = swap.current(team.paths, name)
+        if latest.get("swap") != (team.member(name) or {}).get("swap"):
+            self._reload_roster(team)
+            return
+        if swap.active(latest):
+            return
         state = rt.restart or {}
         phase = state.get("phase")
         pane_id = str(state.get("pane_id") or "")
@@ -3818,7 +3996,20 @@ class Daemon:
                 return  # still up, or not readable yet
             argv = [str(a) for a in state.get("argv") or []]
             # ``agent start`` runs the kind's own binary; the resume argv's first word is that binary.
-            handle = _launch.start_agent_async(self.api, name, str(state.get("kind") or ""), pane_id, args=argv[1:])
+            # Serialize policy writes with launch submission; a changed setting
+            # cancels this queued restart rather than reviving its old bypass.
+            try:
+                with store.FileLock(team.paths.root / "restore.lock", timeout=0, code="permissions_busy"):
+                    doc = store.RosterStore(team.paths).load()
+                    row = next((m for m in doc.get("members", []) if m.get("name") == name), {})
+                    if _permissions.effective(doc.get("config"), row) != state.get("permissions", "yolo"):
+                        self._restart_failed(team, name, rt, "permissions changed; resume the member with its saved setting", now)
+                        return
+                    handle = _launch.start_agent_async(self.api, name, str(state.get("kind") or ""), pane_id, args=argv[1:])
+            except HerdrTeamError as err:
+                if err.code == "permissions_busy":
+                    return
+                raise
             state.update({"phase": "starting", "started_ms": now, "handle": handle})
             phase = "starting"
             self.log("{}: {} exited; starting again: {}".format(team.name, name, " ".join(handle.argv)))
@@ -4124,6 +4315,15 @@ class Daemon:
         kind = str(job.get("kind") or "")
         member_name = job.get("member")
         member = team.member(str(member_name)) if isinstance(member_name, str) else None
+        from herdr_team import swap
+        if member is not None:
+            latest = swap.current(team.paths, str(member_name))
+            if latest.get("swap") and latest.get("swap") != member.get("swap"):
+                self._reload_roster(team)
+                member = team.member(str(member_name))
+            if swap.stale_job(latest, job):
+                self._append_system(team, "swap_control_cancelled", "{}: old {} cancelled by agent swap".format(member_name, kind), ["human"])
+                return
         self.log("{}: job {} for {}".format(team.name, kind, member_name))
         if kind == "brief":
             if member is None:
@@ -4287,6 +4487,9 @@ class Daemon:
 
     def _evaluate_member(self, team: TeamState, member: Dict[str, Any], pending: Pending, now: float) -> None:
         name = str(member["name"])
+        from herdr_team import swap
+        if swap.active(member):
+            return
         rt = team.rt(name)
         # 1. cursor re-read
         cursor, seen = read_cursor_state(team.paths, name)
@@ -4379,13 +4582,18 @@ class Daemon:
         if pending.kind == "nudge" and pending.landed_ms is None and pending.last_added_ms is not None and now - pending.last_added_ms < team.gate_config.burst_window_ms:
             return  # let a same-second burst settle so one nudge covers the whole range (plan 12)
         if name in team.open_intents:
-            # A prior daemon sent this without recording a result: count it as sent once.
+            # A prior daemon sent this without recording a result: count it as sent once,
+            # but only for the posts it carried. An intent about other posts says nothing here.
             entry = team.open_intents.pop(name)
-            pending.landed_ms = now
-            pending.attempts = max(pending.attempts, int(entry.get("attempts") or 1))
-            pending.landed_seq_max = max(pending.seqs) if pending.seqs else 0
-            self.log("{}: open intent {} for {} counts as sent".format(team.name, entry.get("id"), name))
-            return
+            carried = {s for s in (entry.get("seqs") or []) if isinstance(s, int) and not isinstance(s, bool)}
+            if pending.landed_ms is None and carried & set(pending.seqs):
+                pending.landed_ms = now
+                pending.attempts = max(pending.attempts, int(entry.get("attempts") or 1))
+                pending.landed_seq_max = max(pending.seqs) if pending.seqs else 0
+                pending.attempt_id = str(entry.get("id"))
+                self.log("{}: open intent {} for {} counts as sent".format(team.name, entry.get("id"), name))
+                return
+            self.log("{}: open intent {} for {} was about {}, not {}; ignored".format(team.name, entry.get("id"), name, sorted(carried), pending.seqs))
         self._update_interrupt_state(team, name, str(member.get("kind")), pending, now)
         snapshot = self._snapshot(team, member, agent, rt, now, pending)
         pending_work = self._pending_work(team, pending, cursor)
@@ -4667,6 +4875,10 @@ class Daemon:
         zero). A roster terminal that moved to another pane is refused too,
         without the counter: reconcile adopts the new pane id first.
         """
+        from herdr_team import swap
+        latest = swap.current(team.paths, str(member.get("name")))
+        if swap.active(latest) or (latest.get("swap") and latest.get("generation") != member.get("generation")):
+            return False
         terminal_id = agent.get("terminal_id")
         roster_terminal = member.get("terminal_id")
         ok = isinstance(terminal_id, str) and terminal_id == roster_terminal and team.member_by_terminal(terminal_id) is not None
@@ -4848,7 +5060,11 @@ class Daemon:
         rt = team.rt(name)
         self.log("{}: {} -> {} {}".format(team.name, name, result, json.dumps(details, ensure_ascii=False)[:300]))
         pending.follow_up_due = False
-        if result in (RESULT_LANDED_WORKING, RESULT_DRY):
+        # In-turn text is queued by every supported harness (Claude, Codex,
+        # OpenCode, Pi steering), so it is a landing: re-nudged on the
+        # schedule after a completed turn, at most ``RENUDGE_AFTER_S`` times.
+        # Retried as a transient failure it re-typed every ~60 s until the TTL.
+        if result in (RESULT_LANDED_WORKING, RESULT_LANDED_IN_TURN, RESULT_DRY):
             rt.last_nudge_ms = now
             self.global_last_nudge_ms = now
             pending.landed_ms = now
@@ -4888,6 +5104,9 @@ class Daemon:
                 seq_list = ", ".join("#{}".format(s) for s in pending.seqs)
                 nudged_extra: Dict[str, Any] = {"seqs": list(pending.seqs)}
                 text = "nudged {} for {}".format(name, seq_list)
+                if result == RESULT_LANDED_IN_TURN:
+                    nudged_extra["in_turn"] = True
+                    text += " (queued in a running turn)"
                 if pending.interrupt_sent:
                     senders = sorted(pending.interrupt_authors)
                     nudged_extra.update({"interrupt": True, "interrupt_by": senders})
@@ -4916,14 +5135,10 @@ class Daemon:
         if result == RESULT_WRONG_OCCUPANT:
             # Re-resolve the member before any retry, and back off like a transient failure.
             self.reconcile_due = True
-        # transient, landed_in_turn, not_submitted, wrong_occupant: back off 3 .. 60 s
+        # transient, not_submitted, wrong_occupant: back off 3 .. 60 s
         pending.transient_failures += 1
         backoff = min(TRANSIENT_BACKOFF_MAX_S, TRANSIENT_BACKOFF_MIN_S * (2 ** (pending.transient_failures - 1)))
         pending.next_eligible_ms = now + backoff * 1000.0
-        if result == RESULT_LANDED_IN_TURN:
-            # The text landed inside a turn: treat as sent but unread; re-nudge on the schedule.
-            rt.last_nudge_ms = now
-            self.global_last_nudge_ms = now
 
     # -- say: a human line typed into a member now (docs/cli.md section 7) ------------------------
 
@@ -5400,6 +5615,7 @@ class Daemon:
                     "manager": bool(member.get("manager")),
                     "model": member.get("model"),
                     "effort": member.get("effort"),
+                    "permissions": _permissions.view(team.roster.get("config"), member) if member.get("kind") != "human" else None,
                     "model_effective": _models.effective_setting(team.roster.get("config"), member)[0],
                     "setting": _models.label(*_models.effective_setting(team.roster.get("config"), member)),
                     "restarting": isinstance(rt.restart, dict),
