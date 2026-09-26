@@ -416,8 +416,16 @@ class CreateNew(unittest.TestCase):
         self.assertEqual(cmd_roster.agent_start_argv("t-qa", "codex", "w9:p3"), ["agent", "start", "t-qa", "--kind", "codex", "--pane", "w9:p3", "--timeout", "60000"])
 
     def test_spawn_spec(self):
-        self.assertEqual(cmd_roster.parse_spawn_spec("reviewer:codex"), ("reviewer", "codex", None))
-        self.assertEqual(cmd_roster.parse_spawn_spec("worker:claude:/tmp/a:b"), ("worker", "claude", "/tmp/a:b"))
+        self.assertEqual(cmd_roster.parse_spawn_spec("reviewer:codex"), ("reviewer", "codex", None, None))
+        self.assertEqual(cmd_roster.parse_spawn_spec("worker:claude:/tmp/a:b"), ("worker", "claude", None, "/tmp/a:b"))
+        self.assertEqual(cmd_roster.parse_spawn_spec("skeptic:opencode/plan"), ("skeptic", "opencode", "plan", None))
+        self.assertEqual(cmd_roster.parse_spawn_spec("writer:claude/drafter:/tmp/w"), ("writer", "claude", "drafter", "/tmp/w"))
+        self.assertEqual(cmd_roster.parse_spawn_spec("ops:codex/fast"), ("ops", "codex", "fast", None))
+        for bad, code in (("x:pi/plan", "profile_unsupported"), ("x:opencode/", None), ("x:opencode/-rf", None), ("x:opencode/a b", None)):
+            with self.assertRaises(Exception, msg=bad) as caught:
+                cmd_roster.parse_spawn_spec(bad)
+            if code:
+                self.assertEqual(caught.exception.code, code)
         code = None
         try:
             cmd_roster.parse_spawn_spec("worker:nokind")
@@ -451,6 +459,25 @@ class CreateNew(unittest.TestCase):
             self.assertEqual(request["workspace_id"], "w9")
             self.assertEqual(request["root"]["second"]["cwd"], "/tmp/work")
             self.assertEqual(request["root"]["first"]["env"]["HERDR_TEAM_DIR"], os.fspath(ts.session.team("delta").root))
+
+    def test_other_kinds_spawn_with_their_own_yolo_switch_unless_native(self):
+        for mode, extra in ((None, []), ("native", ["--permissions", "native"])):
+            with self.subTest(mode=mode), TempState(write_team=False) as ts:
+                api = live_api()
+
+                def layout_apply(params, api=api):
+                    api.rows.append(fake_agent("w9:p1", "term_n1", "cursor", None))
+                    api.rows.append(fake_agent("w9:p2", "term_n2", "gemini", None))
+                    return {"type": "layout_apply", "layout": {"workspace_id": "w9", "tab_id": "w9:t1", "zoomed": False, "focused_pane_id": "w9:p1", "root": {"type": "split", "direction": "right", "ratio": 0.5, "first": {"type": "pane", "pane_id": "w9:p1"}, "second": {"type": "pane", "pane_id": "w9:p2"}}}}
+
+                api.set_response("layout.apply", layout_apply)
+                api.set_cli(["agent", "start"], 0, "{}", "")
+                code, _payload, err = json_out(run_cli(["--json", "create", "delta", "--new", "--workspace", "w9", "--spawn", "hunter:cursor", "--spawn", "scout:gemini",
+                                                         "--brief", "hunter=Hunt.", "--brief", "scout=Scout."] + extra, env_no_daemon(ts), api))
+                self.assertEqual(code, 0, err)
+                starts = [run for run in api.runs if run[:2] == ["agent", "start"]]
+                self.assertEqual([run[run.index("--") + 1:] if "--" in run else [] for run in starts],
+                                 [["--force"], ["--yolo"]] if mode is None else [[], []])
 
 
 class StartAgent(unittest.TestCase):
